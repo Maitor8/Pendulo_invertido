@@ -22,13 +22,11 @@ except ImportError:
 #  CONFIGURACIÓN
 # =====================================================================
 FS_HZ = 100                    # frecuencia de adquisición / telemetría
-DT = 1.0 / FS_HZ
 PLOT_HZ = 20                  # refresco visual: 20 Hz es fluido y deja libre el event loop
 PLOT_DT_MS = round(1000 / PLOT_HZ)
 MANUAL_KEEPALIVE_MS = 150
 STATUS_HZ = 2                 # la barra de estado no necesita actualizarse 50 veces/s
 HISTORIAL_S = 30              # segundos de histórico en pantalla
-SIMULAR_TELEMETRIA = False     # poner en False cuando el ESP32 emita telemetría real
 timeout_handshake = 10000
 ping_interval_ms= 2000
 timeout_ack = 2000
@@ -63,6 +61,7 @@ class SerialManager(QtCore.QObject):
     handshake_ok = QtCore.pyqtSignal(dict)
     handshake_perdido = QtCore.pyqtSignal()                
     ganancias_ack = QtCore.pyqtSignal(bool, str, dict) 
+    respuesta_exc = QtCore.pyqtSignal(bool, str)
     _HDR = b'\xAA\xBB'
     _PKT_LEN = 20
 
@@ -236,7 +235,8 @@ class SerialManager(QtCore.QObject):
                 self.handshake_perdido.emit()
 
             self.handshake_completo = False
-            self._escribir(b"READY\n")      
+            if self._port and self._port.is_open:
+                self._escribir(b"READY\n")    
 
         elif linea.startswith("STATE,"):
             try:
@@ -259,11 +259,11 @@ class SerialManager(QtCore.QObject):
         elif linea.startswith("ACK,EXC,"):
             tipo = linea[8:].strip()
             print(f"[UART] ACK excitación: {tipo}")
-            self.ganancias_ack.emit(True, f"Excitación {tipo} iniciada", {})  # reuso signal
+            self.respuesta_exc.emit(True, f"Excitación {tipo}")
 
         elif linea.startswith("NACK,NOT_OPEN_LOOP"):
             print("[UART] NACK: no está en modo OPEN_LOOP")
-            self.ganancias_ack.emit(False, "El ESP32 no está en modo OpenLoop", {})
+            self.respuesta_exc.emit(False, "El ESP32 no está en modo Lazo Abierto")
 
         elif linea.startswith("ACK,"):
         # "ACK,L=1.0,2.0,3.0"
@@ -428,23 +428,18 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self.serial.handshake_ok.connect(self._on_handshake)
         self.serial.handshake_perdido.connect(self._on_handshake_perdido)
         self.serial.ganancias_ack.connect(self._on_ganancias_ack)
+        self.serial.respuesta_exc.connect(self._on_respuesta_exc)
 
         # ---------- UI ----------
         self._build_ui()
         self.setStyleSheet(ESTILO_GLOBAL)
-        self._on_mode_changed("STANDBY")
+        self._on_mode_changed("STANDBY", forzar=True)
         self._set_controles_conectados(False)
 
         # Captura de flechas ← → en modo manual (ver eventFilter)
         QtWidgets.QApplication.instance().installEventFilter(self)
         self._sc_kill = QtGui.QShortcut(QtGui.QKeySequence("Esc"), self)
         self._sc_kill.activated.connect(self._on_kill_switch)
-
-       
-        self.sample_timer = QtCore.QTimer(self)
-        self.sample_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
-        self.sample_timer.timeout.connect(self._sample_tick)
-        self.sample_timer.start(round(DT * 1000))
 
         self.plot_timer = QtCore.QTimer(self)
         self.plot_timer.setTimerType(QtCore.Qt.TimerType.CoarseTimer)
@@ -547,6 +542,11 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([930, 350])
         layout_principal.addWidget(splitter)
+
+        #Mensajes de evento
+        self.lbl_evento = QtWidgets.QLabel("")
+        self.lbl_evento.setStyleSheet("color: #b00; padding-right: 8px;")
+        self.statusBar().addPermanentWidget(self.lbl_evento)
 
     # ---- Grupo: conexión UART ----
     def _crear_grupo_conexion(self):
@@ -725,7 +725,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self.sp_pr_br.setRange(0.1, 10.0); self.sp_pr_br.setValue(2.0)
         self.sp_pr_br.setSuffix(" Hz")
         self.sp_pr_br.setToolTip("Frecuencia de cambio de bit.\n"
-                                "Mantener ≤ 10 Hz para buena resolución a 50 Hz de muestreo.")
+                                "Mantener ≤ 10 Hz para buena resolución a 100 Hz de muestreo.")
         self.sp_pr_amp = QtWidgets.QDoubleSpinBox()
         self.sp_pr_amp.setRange(1, 100); self.sp_pr_amp.setValue(5)
         self.sp_pr_amp.setSuffix(" %")
@@ -1028,7 +1028,12 @@ class InterfazPendulo(QtWidgets.QMainWindow):
                 self._ofrecer_exportar_tras_corte()
             return
 
-        if self.serial.conectar(self.cmb_port.currentText()):
+        puerto = self.cmb_port.currentText()
+        if not puerto or puerto.startswith("("):
+            QtWidgets.QMessageBox.warning(self, "Sin puerto",
+                                        "No hay un puerto serie válido seleccionado.")
+            return
+        if self.serial.conectar(puerto):
             self._reset_datos_sesion()
             self.btn_connect.setText("Desconectar")
             self._set_controles_conectados(False)      # nada funciona hasta handshake
@@ -1046,7 +1051,8 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         """Se dispara cuando el hilo de lectura muere por su cuenta (cable
         desconectado, driver, puerto cerrado por otro proceso, etc.)."""
         print(f"[UI] UART caído: {motivo}")
-
+        self._hs_timer.stop()            
+        self._sincronizado = False        
         # Cerrar limpio. Como el hilo ya salió del while, el join() interno
         # de desconectar() retorna de inmediato (no bloquea la GUI).
         if self.serial.connected:
@@ -1081,7 +1087,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         if self.serial.connected and not self.serial.handshake_completo:
             QtWidgets.QMessageBox.warning(
                 self, "Sin respuesta",
-                "El puerto se abrió pero el ESP32 no respondió al handshake"
+                "El puerto se abrió pero el ESP32 no respondió al handshake en "
                 f"{timeout_handshake/1000:.0f} s.\n"
                 "Verifique que el firmware tenga el protocolo HELLO/READY/STATE."
             )
@@ -1089,8 +1095,6 @@ class InterfazPendulo(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(dict)
     def _on_handshake(self, info):
         print(f"[UI] Handshake OK con firmware {info['firmware']}")
-
-        self.gains = {'L1': info['L1'], 'L2': info['L2'], 'L3': info['L3']}
         self._hs_timer.stop()
         self.gains = {'L1': info['L1'], 'L2': info['L2'], 'L3': info['L3']}
         if not self._sincronizado:
@@ -1114,13 +1118,24 @@ class InterfazPendulo(QtWidgets.QMainWindow):
             f"L=({info['L1']:.4f}, {info['L2']:.4f}, {info['L3']:.4f})"
         )
     
+    @QtCore.pyqtSlot(bool, str)
+    def _on_respuesta_exc(self, ok: bool, texto: str):
+        self._mostrar_evento(("✔ " if ok else "⚠ ") + texto, ms=6000,
+                            color="#2e7d32" if ok else "#b00")
+
+    def _mostrar_evento(self, texto: str, ms: int = 6000, color: str = "#b00"):
+        self.lbl_evento.setStyleSheet(f"color: {color}; padding-right: 8px;")
+        self.lbl_evento.setText(texto)
+        self._evento_timer.start(ms)
+
     @QtCore.pyqtSlot()
     def _on_handshake_perdido(self):
         print("[UI] Handshake perdido — bloqueando controles")
+        self._sincronizado = False
         self._forzar_standby()
         detenida = self._detener_grabacion()
         self._set_controles_conectados(False)
-        self.statusBar().showMessage("⚠ Handshake perdido con el ESP32")
+        self._mostrar_evento("⚠ Handshake perdido con el ESP32", ms=10000)
         if detenida:
             self._ofrecer_exportar_tras_corte()
 
@@ -1139,11 +1154,12 @@ class InterfazPendulo(QtWidgets.QMainWindow):
             vb.setYRange(-1, 1, padding=0.0)
         self._status_div = 0
 
-    def _on_mode_changed(self, modo):
+    def _on_mode_changed(self, modo, forzar=False):
         if modo != "STANDBY" and not self.serial.handshake_completo:
             self.mode_buttons["STANDBY"].setChecked(True)
             return
-        
+        if modo == self.mode and not forzar:
+            return
         self._liberar_manual()
         self.mode = modo
         print(f"[UI] Cambio de modo -> {modo}")
@@ -1202,15 +1218,15 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self._ack_timer.stop()
 
         if ok:
-            self.gains = gains              # valores confirmados por el firmware
-            for key, le in self.inputs_L.items():
-                le.setText(f"{self.gains[key]:g}")
+            self.gains = gains     
+            self._restaurar_campos_ganancias()
             QtWidgets.QMessageBox.information(
                 self, "Confirmado",
                 f"El ESP32 confirmó las ganancias:\n"
                 f"L = ({gains['L1']:.4f}, {gains['L2']:.4f}, {gains['L3']:.4f})"
             )
         else:
+            self._restaurar_campos_ganancias()
             QtWidgets.QMessageBox.critical(
                 self, "Rechazado por el ESP32",
                 f"El ESP32 no aceptó las ganancias.\n\nMotivo: {motivo}"
@@ -1218,10 +1234,16 @@ class InterfazPendulo(QtWidgets.QMainWindow):
 
         self._update_gain_button_state()
 
+    def _restaurar_campos_ganancias(self):
+        """Deja en los campos las últimas ganancias confirmadas por el firmware."""
+        for key, le in self.inputs_L.items():
+            le.setText(f"{self.gains[key]:g}")
+
     def _on_ack_timeout(self):
         if not self._ack_pendiente:
             return
         self._ack_pendiente = False
+        self._restaurar_campos_ganancias()
         QtWidgets.QMessageBox.warning(
             self, "Sin respuesta",
             f"El ESP32 no confirmó las ganancias en {timeout_ack/1000:.1f} s.\n"
@@ -1286,24 +1308,6 @@ class InterfazPendulo(QtWidgets.QMainWindow):
 
         if self.recording:
             self.recorded_data.append((t, theta, omega, v_disco, u))
-
-    def _simular_muestra(self):
-        """" Es sólo para simular, ya no la uso"""
-        self.t += DT
-        t = self.t
-        w1, w2 = 2 * math.pi * 0.30, 2 * math.pi * 3.7
-
-        theta = 0.60 * math.sin(w1 * t) + 0.04 * math.sin(w2 * t)
-        omega = 0.60 * w1 * math.cos(w1 * t) + 0.04 * w2 * math.cos(w2 * t)
-        v_disk = (45.0 * math.sin(2 * math.pi * 0.12 * t)
-                + 4.0 * math.sin(2 * math.pi * 2.1 * t))
-        u = 5.0 * math.sin(2 * math.pi * 0.5 * t)   # excitación simulada
-        self.serial.telemetria.emit(t, theta, omega, v_disk, u)
-
-    def _sample_tick(self):
-        """Adquisición/simulación. Debe ser muy liviana: no repinta la interfaz."""
-        if SIMULAR_TELEMETRIA:
-            self._simular_muestra()
 
     def _plot_tick(self):
         """Refresco visual desacoplado de la adquisición para mantener la UI fluida."""
