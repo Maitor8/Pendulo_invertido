@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import csv
 import math
-# import re
+import time
 import sys
 import struct          # <-- NUEVO: Para decodificar binario
 import threading       # <-- NUEVO: Para leer sin congelar la GUI
@@ -9,7 +9,7 @@ from collections import deque
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6 import QtCore, QtWidgets
+from PyQt6 import QtCore, QtGui, QtWidgets
 try:
     import serial  # noqa: F401
     import serial.tools.list_ports
@@ -21,10 +21,11 @@ except ImportError:
 # =====================================================================
 #  CONFIGURACIÓN
 # =====================================================================
-FS_HZ = 50                    # frecuencia de adquisición / telemetría
+FS_HZ = 100                    # frecuencia de adquisición / telemetría
 DT = 1.0 / FS_HZ
 PLOT_HZ = 20                  # refresco visual: 20 Hz es fluido y deja libre el event loop
 PLOT_DT_MS = round(1000 / PLOT_HZ)
+MANUAL_KEEPALIVE_MS = 150
 STATUS_HZ = 2                 # la barra de estado no necesita actualizarse 50 veces/s
 HISTORIAL_S = 30              # segundos de histórico en pantalla
 SIMULAR_TELEMETRIA = False     # poner en False cuando el ESP32 emita telemetría real
@@ -62,6 +63,8 @@ class SerialManager(QtCore.QObject):
     handshake_ok = QtCore.pyqtSignal(dict)
     handshake_perdido = QtCore.pyqtSignal()                
     ganancias_ack = QtCore.pyqtSignal(bool, str, dict) 
+    _HDR = b'\xAA\xBB'
+    _PKT_LEN = 20
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -71,7 +74,8 @@ class SerialManager(QtCore.QObject):
         self._detener = threading.Event()
         self.t_acumulado = 0.0
         self.handshake_completo = False 
-        self.firmware_version = "?"     
+        self.firmware_version = "?"   
+        self._tx_lock= threading.Lock()  
 
     # ---- Conexión ----
     def conectar(self, puerto, baud=115200):
@@ -90,9 +94,9 @@ class SerialManager(QtCore.QObject):
             self.handshake_completo = False
             self.firmware_version = "?"
 
-            threading.Event().wait(0.1)
-            self._port.write(b"HELLO?\n")
-            self._port.flush()
+            time.sleep(0.1)
+            self._port.reset_input_buffer()
+            self._escribir(b"HELLO?\n")
             print("[UART] -> HELLO? (reset solicitado)")
 
             # Lanzar el hilo receptor
@@ -114,11 +118,20 @@ class SerialManager(QtCore.QObject):
             self._port.close()
 
     # ---- Envíos ----
-    def _send(self, cmd: str):
-        print(f"[UART TX] -> {cmd}")
-        # Cuando el ESP32 esté listo para recibir, descomentas esto:
-        if self._port and self._port.is_open: 
-            self._port.write((cmd + '\n').encode())
+    def _escribir(self, datos: bytes):
+        """Escritura serializada: la GUI y el hilo lector (READY) escriben al mismo puerto."""
+        with self._tx_lock:
+            if self._port and self._port.is_open:
+                try:
+                    self._port.write(datos)
+                    self._port.flush()
+                except Exception as e:
+                    print(f"[UART] Error escribiendo: {e}")
+
+    def _send(self, cmd: str, silencioso: bool=False):
+        if not silencioso:
+            print(f"[UART TX] - > {cmd}")
+        self._escribir((cmd+ '\n').encode())
 
     def enviar_ganancias(self, gains: dict):
         cmd = "L:" + ",".join(f"{gains[k]:.6f}" for k in sorted(gains))
@@ -128,17 +141,17 @@ class SerialManager(QtCore.QObject):
         self._send(f"MODE:{modo}")
 
     def enviar_manual(self, direccion: str):
-        self._send(f"MANUAL:{direccion}")
+        self._send(f"MANUAL:{direccion}", silencioso=True)
 
-    def enviar_lazo_abierto(self, voltaje: float):
-        self._send(f"OPENLOOP:{voltaje:.3f}")
+    # def enviar_lazo_abierto(self, voltaje: float):
+    #     self._send(f"OPENLOOP:{voltaje:.3f}")
 
     def enviar_estop(self):
         self._send("ESTOP")   
+
     def enviar_ping(self):
         """Heartbeat silencioso. No imprime en consola para no saturar."""
-        if self._port and self._port.is_open:
-            self._port.write(b"PING\n")
+        self._escribir(b"PING\n")
 
     def enviar_excitacion(self, tipo: str, params: dict):
         """Envía el comando de excitación al ESP32."""
@@ -157,59 +170,60 @@ class SerialManager(QtCore.QObject):
 
     # ---- Hilo Receptor de Binarios ----
     def _leer_uart(self):
-        """
-        Hilo lector. Distingue entre texto ASCII (HELLO/STATE) y binario
-        (telemetría con cabecera 0xAA 0xBB) leyendo byte a byte.
-        """
-        buf_texto = bytearray()
-
+        """Hilo lector. Lee en bloques con timeout; separa binario de ASCII."""
+        buf = bytearray()
         while not self._detener.is_set():
             try:
-                if self._port.in_waiting == 0:
-                    continue
-
-                b = self._port.read(1)
-                if not b:
-                    continue
-
-                # --- Caso 1: primer byte binario (0xAA) ---
-                if b == b'\xAA':
-                    b2 = self._port.read(1)
-                    if b2 == b'\xBB':
-                        payload = self._port.read(18)
-                        if len(payload) == 18:
-                            dt, theta, theta_dot, omega, u_raw = struct.unpack('<ffffh', payload)
-                            self.t_acumulado += dt
-                            self.telemetria.emit(self.t_acumulado, theta, theta_dot, omega, u_raw/100.0)
-                    else:
-                        # Falsa alarma, era un 0xAA suelto dentro de un texto binario
-                        buf_texto.clear()
-                    continue
-
-                # --- Caso 2: texto ASCII ---
-                if b == b'\n' or b == b'\r':
-                    if buf_texto:
-                        linea = buf_texto.decode('ascii', errors='ignore').strip()
-                        buf_texto.clear()
-                        if linea:
-                            self._procesar_linea_ascii(linea)
-                    continue
-
-                # Acumular solo ASCII imprimible
-                if 0x20 <= b[0] <= 0x7E:
-                    buf_texto.append(b[0])
-                    # Protección contra buffer gigante (mensaje sin '\n')
-                    if len(buf_texto) > 256:
-                        buf_texto.clear()
-                else:
-                    # Byte raro: resetear buffer de texto
-                    buf_texto.clear()
-
+                chunk = self._port.read(max(1, self._port.in_waiting))
             except Exception as e:
                 if not self._detener.is_set():
                     print(f"[UART] Excepción leyendo puerto: {e}")
                     self.desconectado.emit(str(e))
                 break
+            if not chunk:
+                continue
+            buf.extend(chunk)
+            self._consumir(buf)
+
+    def _consumir(self, buf: bytearray):
+        """Extrae de 'buf' todos los paquetes y líneas completos."""
+        while buf:
+            i_hdr = buf.find(self._HDR)
+            cand = [i for i in (buf.find(b'\n'), buf.find(b'\r')) if i >= 0]
+            i_nl = min(cand) if cand else -1
+
+            if i_nl >= 0 and (i_hdr < 0 or i_nl < i_hdr):
+                linea = bytes(buf[:i_nl]).decode('ascii', errors='ignore').strip()
+                del buf[:i_nl + 1]
+                if linea and linea.isprintable():
+                    self._procesar_linea_ascii(linea)
+                continue
+
+            if i_hdr >= 0:
+                if i_hdr > 0:
+                    del buf[:i_hdr]
+                if len(buf) < self._PKT_LEN:
+                    return
+                dt, theta, theta_dot, omega, u_raw = struct.unpack(
+                    '<ffffh', bytes(buf[2:self._PKT_LEN]))
+                if self._paquete_plausible(dt, theta, theta_dot, omega):
+                    del buf[:self._PKT_LEN]
+                    self.t_acumulado += dt
+                    self.telemetria.emit(self.t_acumulado, theta, theta_dot,
+                                        omega, u_raw / 100.0)
+                else:
+                    del buf[:1]
+                continue
+
+            if len(buf) > 256:
+                buf.clear()
+            return
+
+    @staticmethod
+    def _paquete_plausible(dt, theta, theta_dot, omega):
+        return (0.0 < dt < 1.0
+                and all(math.isfinite(v) and abs(v) < 1e5
+                        for v in (theta, theta_dot, omega)))
 
     def _procesar_linea_ascii(self, linea: str):
         if linea.startswith("HELLO,"):
@@ -222,8 +236,7 @@ class SerialManager(QtCore.QObject):
                 self.handshake_perdido.emit()
 
             self.handshake_completo = False
-            if self._port and self._port.is_open:
-                self._port.write(b"READY\n")
+            self._escribir(b"READY\n")      
 
         elif linea.startswith("STATE,"):
             try:
@@ -386,10 +399,19 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self._ack_timer = QtCore.QTimer(self)
         self._ack_timer.setSingleShot(True)
         self._ack_timer.timeout.connect(self._on_ack_timeout)
+        self._sincronizado = False
+        self._hs_timer = QtCore.QTimer(self)
+        self._hs_timer.setSingleShot(True)
+        self._hs_timer.timeout.connect(self._check_handshake_timeout)
+        self._evento_timer = QtCore.QTimer(self)
+        self._evento_timer.setSingleShot(True)
+        self._evento_timer.timeout.connect(lambda: self.lbl_evento.setText(""))
 
         # Control manual: qué entradas (botón / tecla) están sostenidas
         self._manual_held = set()
         self._manual_last = "STOP"
+        self._manual_timer = QtCore.QTimer(self)
+        self._manual_timer.timeout.connect(self._manual_keepalive)  
 
         # ---------- Buffers (histórico deslizante) ----------
         n = HISTORIAL_S * FS_HZ
@@ -415,6 +437,8 @@ class InterfazPendulo(QtWidgets.QMainWindow):
 
         # Captura de flechas ← → en modo manual (ver eventFilter)
         QtWidgets.QApplication.instance().installEventFilter(self)
+        self._sc_kill = QtGui.QShortcut(QtGui.QKeySequence("Esc"), self)
+        self._sc_kill.activated.connect(self._on_kill_switch)
 
        
         self.sample_timer = QtCore.QTimer(self)
@@ -952,6 +976,15 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         if cmd != self._manual_last:
             self._manual_last = cmd
             self.serial.enviar_manual(cmd)
+        if cmd == "STOP":
+            self._manual_timer.stop()
+        elif not self._manual_timer.isActive():
+            self._manual_timer.start(MANUAL_KEEPALIVE_MS)
+
+    def _manual_keepalive(self):
+        if (self._manual_last != "STOP" and self.mode == "MANUAL"
+                and self.serial.handshake_completo):
+            self.serial.enviar_manual(self._manual_last)
 
     def _liberar_manual(self):
         self._manual_held.clear()
@@ -983,6 +1016,8 @@ class InterfazPendulo(QtWidgets.QMainWindow):
     # -----------------------------------------------------------------
     def _on_connect(self):
         if self.serial.connected:
+            self._hs_timer.stop()
+            self._sincronizado = False
             self._forzar_standby()
             self.serial.desconectar()
             detenida = self._detener_grabacion() 
@@ -997,7 +1032,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
             self._reset_datos_sesion()
             self.btn_connect.setText("Desconectar")
             self._set_controles_conectados(False)      # nada funciona hasta handshake
-            QtCore.QTimer.singleShot(timeout_handshake, self._check_handshake_timeout)
+            self._hs_timer.start(timeout_handshake)
         else:
             QtWidgets.QMessageBox.critical(
                 self, "Error de conexión",
@@ -1056,8 +1091,12 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         print(f"[UI] Handshake OK con firmware {info['firmware']}")
 
         self.gains = {'L1': info['L1'], 'L2': info['L2'], 'L3': info['L3']}
-        for key, le in self.inputs_L.items():
-            le.setText(f"{self.gains[key]:g}")
+        self._hs_timer.stop()
+        self.gains = {'L1': info['L1'], 'L2': info['L2'], 'L3': info['L3']}
+        if not self._sincronizado:
+            for key, le in self.inputs_L.items():
+                le.setText(f"{self.gains[key]:g}")
+            self._sincronizado = True
 
         self._set_controles_conectados(True)
 
@@ -1093,7 +1132,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self.vel_buf.clear()
         self.disco_buf.clear()
         self.u_buf.clear()
-        for panel in (self.panel_pos_barra, self.panel_vel_barra, self.panel_vel_disco):
+        for panel in self._paneles_graficas.values():
             panel.curve.setData([], [])
             vb = panel.plot.getViewBox()
             vb.setXRange(0, 1, padding=0.0)
