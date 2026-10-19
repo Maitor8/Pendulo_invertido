@@ -32,123 +32,73 @@ timeout_ack = 2000
 
 # Estilos Claro
 ESTILO_GLOBAL_CLARO = """
-    QMainWindow { background-color: #f5f5f5; color: #212121; }
-    QWidget { font-size: 10pt; }
+    QMainWindow, QDialog, QMessageBox { background-color: #f5f5f5; color: #212121; }
+    QWidget { font-size: 10pt; color: #212121; }
+    QScrollArea, QScrollArea > QWidget > QWidget { background-color: transparent; border: none; }
     QGroupBox {
-        font-weight: bold;
-        border: 1px solid #dcdcdc;
-        border-radius: 6px;
-        margin-top: 8px;
-        padding-top: 12px;
-        background-color: #ffffff;
+        font-weight: bold; border: 1px solid #dcdcdc; border-radius: 6px;
+        margin-top: 8px; padding-top: 12px; background-color: #ffffff;
     }
-    QGroupBox::title {
-        subcontrol-origin: margin;
-        subcontrol-position: top left;
-        padding: 0 5px;
-        color: #333333;
-    }
-    QScrollArea { background: transparent; border: none; }
-    QScrollBar:vertical {
-        background: #f0f0f0; width: 10px; margin: 0;
-    }
-    QScrollBar::handle:vertical {
-        background: #cdcdcd; min-height: 20px; border-radius: 5px;
-    }
-    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+    QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 0 5px; color: #333333; }
+    QLabel { background-color: transparent; }
+    QCheckBox { color: #212121; background-color: transparent; }
+    QCheckBox::indicator { width: 14px; height: 14px; border-radius: 2px; border: 1px solid #999999; background: #ffffff; }
+    QCheckBox::indicator:checked { background: #2196F3; border: 1px solid #1976D2; }
     QTabWidget::pane { border: 1px solid #dcdcdc; background-color: #ffffff; }
-    QTabBar::tab {
-        background: #e0e0e0; color: #333333; padding: 6px 14px;
-        border-top-left-radius: 4px; border-top-right-radius: 4px;
-    }
+    QTabBar::tab { background: #e0e0e0; color: #333333; padding: 6px 14px; border-top-left-radius: 4px; border-top-right-radius: 4px; }
     QTabBar::tab:selected { background: #ffffff; font-weight: bold; }
     QLineEdit, QDoubleSpinBox, QComboBox {
-        background-color: #ffffff; color: #111111;
-        border: 1px solid #cccccc; border-radius: 4px; padding: 3px 6px;
+        background-color: #ffffff; color: #111111; border: 1px solid #cccccc; border-radius: 4px; padding: 3px 6px;
     }
-    QLineEdit:focus, QDoubleSpinBox:focus, QComboBox:focus {
-        border: 1px solid #2196F3;
-    }
+    QLineEdit:focus, QDoubleSpinBox:focus, QComboBox:focus { border: 1px solid #2196F3; }
     QComboBox::drop-down { border: none; }
-    QPushButton {
-        border-radius: 4px; padding: 4px 8px; background-color: #e0e0e0; color: #111111;
-    }
+    QComboBox QAbstractItemView { background-color: #ffffff; color: #111111; selection-background-color: #2196F3; selection-color: white; }
+    QPushButton { border-radius: 4px; padding: 4px 8px; background-color: #e0e0e0; color: #111111; border: 1px solid #cccccc; }
     QPushButton:hover { background-color: #d5d5d5; }
-    QPushButton#btnModo {
-        background-color: #eceff1; color: #37474f; font-weight: normal;
-    }
-    QPushButton#btnModo:checked {
-        background-color: #2196F3; color: white; font-weight: bold;
-    }
-    QStatusBar { background: #eeeeee; color: #212121; }
+    QPushButton:disabled { background-color: #eeeeee; color: #999999; border: 1px solid #dcdcdc; }
+    QPushButton#btnModo { background-color: #eceff1; color: #37474f; font-weight: normal; border: none; }
+    QPushButton#btnModo:checked { background-color: #2196F3; color: white; font-weight: bold; }
+    QStatusBar { background: #eeeeee; color: #212121; border-top: 1px solid #dcdcdc; }
+    QScrollBar:vertical { background: #f0f0f0; width: 10px; margin: 0; }
+    QScrollBar::handle:vertical { background: #cdcdcd; min-height: 20px; border-radius: 5px; }
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+    QToolTip { background-color: #ffffff; color: #111111; border: 1px solid #cccccc; }
 """
 
-# Estilos Oscuro / Modo Batman
+# Estilos Oscuro / Modo Oscuro (Azul)
 ESTILO_GLOBAL_BATMAN = """
-    QMainWindow { background-color: #121212; color: #e0e0e0; }
+    QMainWindow, QDialog, QMessageBox { background-color: #121212; color: #e0e0e0; }
     QWidget { font-size: 10pt; color: #e0e0e0; }
+    QScrollArea, QScrollArea > QWidget > QWidget { background-color: transparent; border: none; }
     QGroupBox {
-        font-weight: bold;
-        border: 1px solid #2d2d2d;
-        border-radius: 6px;
-        margin-top: 8px;
-        padding-top: 12px;
-        background-color: #1a1a1a;
-        color: #f5f5f5;
+        font-weight: bold; border: 1px solid #2d2d2d; border-radius: 6px;
+        margin-top: 8px; padding-top: 12px; background-color: #1a1a1a;
     }
-    QGroupBox::title {
-        subcontrol-origin: margin;
-        subcontrol-position: top left;
-        padding: 0 5px;
-        color: #ffcc00;
+    QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 0 5px; color: #00A8FF; }
+    QLabel { background-color: transparent; }
+    QCheckBox { color: #e0e0e0; background-color: transparent; }
+    QCheckBox::indicator { width: 14px; height: 14px; border-radius: 2px; border: 1px solid #555555; background: #222222; }
+    QCheckBox::indicator:checked { background: #00A8FF; border: 1px solid #00A8FF; }
+    QTabWidget::pane { border: 1px solid #2d2d2d; background-color: #1a1a1a; }
+    QTabBar::tab { background: #252525; color: #aaaaaa; padding: 6px 14px; border-top-left-radius: 4px; border-top-right-radius: 4px; }
+    QTabBar::tab:selected { background: #1a1a1a; color: #00A8FF; font-weight: bold; }
+    QLineEdit, QDoubleSpinBox, QComboBox {
+        background-color: #252525; color: #ffffff; border: 1px solid #3d3d3d; border-radius: 4px; padding: 3px 6px;
     }
-    QScrollArea { background: transparent; border: none; }
-    QScrollBar:vertical {
-        background: #181818; width: 10px; margin: 0;
-    }
-    QScrollBar::handle:vertical {
-        background: #333333; min-height: 20px; border-radius: 5px;
-    }
+    QLineEdit:focus, QDoubleSpinBox:focus, QComboBox:focus { border: 1px solid #00A8FF; }
+    QComboBox::drop-down { border: none; }
+    QComboBox QAbstractItemView { background-color: #252525; color: #ffffff; selection-background-color: #00A8FF; selection-color: white; }
+    QPushButton { border-radius: 4px; padding: 4px 8px; background-color: #2a2a2a; color: #e0e0e0; border: 1px solid #383838; }
+    QPushButton:hover { background-color: #383838; }
+    QPushButton:disabled { background-color: #1a1a1a; color: #555555; border: 1px solid #2d2d2d; }
+    QPushButton#btnModo { background-color: #222222; color: #bbbbbb; font-weight: normal; border: 1px solid #333333; }
+    QPushButton#btnModo:checked { background-color: #00A8FF; color: #ffffff; font-weight: bold; border: 1px solid #0099FF; }
+    QStatusBar { background: #0d0d0d; color: #cccccc; border-top: 1px solid #222222; }
+    QScrollBar:vertical { background: #181818; width: 10px; margin: 0; }
+    QScrollBar::handle:vertical { background: #333333; min-height: 20px; border-radius: 5px; }
     QScrollBar::handle:vertical:hover { background: #444444; }
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-    QTabWidget::pane { border: 1px solid #2d2d2d; background-color: #181818; }
-    QTabBar::tab {
-        background: #252525; color: #aaaaaa; padding: 6px 14px;
-        border-top-left-radius: 4px; border-top-right-radius: 4px;
-    }
-    QTabBar::tab:selected { background: #181818; color: #ffcc00; font-weight: bold; }
-    QLineEdit, QDoubleSpinBox, QComboBox {
-        background-color: #252525; color: #ffffff;
-        border: 1px solid #3d3d3d; border-radius: 4px; padding: 3px 6px;
-    }
-    QLineEdit:focus, QDoubleSpinBox:focus, QComboBox:focus {
-        border: 1px solid #ffcc00;
-    }
-    QComboBox::drop-down { border: none; }
-    QComboBox QAbstractItemView {
-        background-color: #252525; color: #ffffff;
-        selection-background-color: #333333; selection-color: #ffcc00;
-    }
-    QPushButton {
-        border-radius: 4px; padding: 4px 8px; background-color: #2a2a2a; color: #e0e0e0;
-        border: 1px solid #383838;
-    }
-    QPushButton:hover { background-color: #383838; }
-    QPushButton#btnModo {
-        background-color: #222222; color: #bbbbbb; font-weight: normal; border: 1px solid #333333;
-    }
-    QPushButton#btnModo:checked {
-        background-color: #ff9800; color: #000000; font-weight: bold; border: 1px solid #ffcc00;
-    }
-    QStatusBar { background: #0d0d0d; color: #cccccc; border-top: 1px solid #222222; }
-    QCheckBox { color: #dddddd; }
-    QCheckBox::indicator {
-        width: 14px; height: 14px; border-radius: 2px;
-        border: 1px solid #555555; background: #222222;
-    }
-    QCheckBox::indicator:checked {
-        background: #ff9800; border: 1px solid #ffcc00;
-    }
+    QToolTip { background-color: #1a1a1a; color: #e0e0e0; border: 1px solid #3d3d3d; }
 """
 
 ESTILO_ENVIAR_CLARO = """
@@ -157,9 +107,9 @@ ESTILO_ENVIAR_CLARO = """
     QPushButton:disabled { background-color: #BDBDBD; color: #F5F5F5; }
 """
 ESTILO_ENVIAR_BATMAN = """
-    QPushButton          { background-color: #d97706; color: black; border: none; font-weight: bold; }
-    QPushButton:hover    { background-color: #f59e0b; }
-    QPushButton:disabled { background-color: #333333; color: #777777; border: 1px solid #262626; }
+    QPushButton          { background-color: #00A8FF; color: white; border: none; font-weight: bold; }
+    QPushButton:hover    { background-color: #0099FF; }
+    QPushButton:disabled { background-color: #1a1a1a; color: #555555; border: 1px solid #2d2d2d; }
 """
 
 ESTILO_GRABAR = """
@@ -175,7 +125,6 @@ ESTILO_KILL = """
 # Alias para compatibilidad
 ESTILO_GLOBAL = ESTILO_GLOBAL_CLARO
 ESTILO_ENVIAR = ESTILO_ENVIAR_CLARO
-
 
 # =====================================================================
 #  WIDGET: TOGGLE SWITCH (Estilo iOS / Material)
@@ -224,8 +173,8 @@ class ToggleSwitch(QtWidgets.QAbstractButton):
 
         # Colores según estado
         if self.isChecked():
-            track_color = QtGui.QColor("#ff9800")      # Batman Yellow/Orange
-            thumb_color = QtGui.QColor("#111111")
+            track_color = QtGui.QColor("#00A8FF")      # Azul Material
+            thumb_color = QtGui.QColor("#FFFFFF")      # Blanco
         else:
             track_color = QtGui.QColor("#cfd8dc")      # Claro
             thumb_color = QtGui.QColor("#ffffff")
@@ -558,9 +507,11 @@ class SerialManager(QtCore.QObject):
 #  PANEL DE GRÁFICA  (pausa, auto-seguir X, autoescala Y)
 # =====================================================================
 class PlotPanel(QtWidgets.QWidget):
-    def __init__(self, titulo, ylabel, color, parent=None):
+    def __init__(self, titulo, ylabel, color, color_dark=None, parent=None):
         super().__init__(parent)
         self.paused = False
+        self._color = color
+        self._color_dark = color_dark if color_dark is not None else color
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -604,10 +555,11 @@ class PlotPanel(QtWidgets.QWidget):
         vb = self.plot.getViewBox()
         vb.enableAutoRange(axis=pg.ViewBox.XAxis, enable=False)
         vb.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
+        self.setMinimumHeight(180)
         self.chk_pause.toggled.connect(self._on_pause)
 
     def set_theme(self, dark: bool):
-        bg = '#141414' if dark else 'w'
+        bg = '#121212' if dark else 'w'
         fg = '#e0e0e0' if dark else 'k'
         grid_alpha = 0.2 if dark else 0.25
         self.plot.setBackground(bg)
@@ -620,6 +572,7 @@ class PlotPanel(QtWidgets.QWidget):
         title_item = self.plot.plotItem.titleLabel
         if title_item:
             title_item.setText(title_item.text, color=fg)
+        self.curve.setPen(pg.mkPen(self._color_dark if dark else self._color, width=2))
 
     def _on_pause(self, activo):
         self.paused = activo
@@ -782,6 +735,24 @@ class PhasePanel(QtWidgets.QWidget):
             except Exception:
                 pass
 
+    def set_theme(self, dark: bool):
+        """Adapta fondo, ejes, título y lecturas al tema activo."""
+        bg = '#121212' if dark else 'w'
+        fg = '#e0e0e0' if dark else 'k'
+        grid_alpha = 0.2 if dark else 0.25
+        self.plot.setBackground(bg)
+        for eje in ('left', 'bottom'):
+            ax = self.plot.getAxis(eje)
+            ax.setPen(pg.mkPen(fg, width=1))
+            ax.setTextPen(pg.mkPen(fg))
+        self.plot.showGrid(x=True, y=True, alpha=grid_alpha)
+        title_item = self.plot.plotItem.titleLabel
+        if title_item:
+            title_item.setText(title_item.text, color=fg)
+        self.lbl_lectura.setStyleSheet(
+            f"font-family: monospace; font-size: 10pt; padding: 2px 6px; color: {fg};"
+        )
+
     def limpiar(self):
         self._datos = None
         for c in self.curvas:
@@ -916,7 +887,12 @@ class InterfazPendulo(QtWidgets.QMainWindow):
 
         # ---------- UI ----------
         self._build_ui()
-        self.setStyleSheet(ESTILO_GLOBAL)
+        self.setStyleSheet(ESTILO_GLOBAL_BATMAN)
+        self.toggle_batman.blockSignals(True)
+        self.toggle_batman.setChecked(True)
+        self.toggle_batman.blockSignals(False)
+        self._on_batman_toggled(True)
+
         self._on_mode_changed("STANDBY", forzar=True)
         self._set_controles_conectados(False)
 
@@ -978,11 +954,11 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self.layout_paneles.setSpacing(6)
 
         # Crear los 4 paneles
-        self.panel_pos_barra = PlotPanel("Posición de la Barra (rad)", "θ (rad)", 'b')
-        self.panel_vel_barra = PlotPanel("Velocidad de la Barra (rad/s)", "ω (rad/s)", 'r')
+        self.panel_pos_barra = PlotPanel("Posición de la Barra (rad)", "θ (rad)", 'b', color_dark='#4fc3f7')  # azul
+        self.panel_vel_barra = PlotPanel("Velocidad de la Barra (rad/s)", "ω (rad/s)", 'r', color_dark='#ff5252')  # rojo
         self.panel_vel_disco = PlotPanel("Velocidad del Disco / Puente H (rad/s)",
-                                        "ω disco (rad/s)", 'g')
-        self.panel_u         = PlotPanel("Señal de control · u", "u (unid. de control)", (255, 140, 0))  # naranja
+                                        "ω disco (rad/s)", 'g', color_dark='#69f0ae')  # verde
+        self.panel_u         = PlotPanel("Señal de control · u", "u (unid. de control)", (255, 140, 0), color_dark='#ffb74d')  # naranja
 
         # Diccionario para acceder por clave desde el selector
         self._paneles_graficas = {
@@ -1022,6 +998,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         layout_controles.addStretch()
         scroll.setWidget(contenido)
 
+        layout_derecho.addWidget(self._crear_grupo_apariencia())
         layout_derecho.addWidget(scroll, stretch=1)
         # El KILL SWITCH queda fuera del scroll: nunca puede quedar oculto
         layout_derecho.addWidget(self._crear_grupo_seguridad())
@@ -1310,7 +1287,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
 
             lbl = QtWidgets.QLabel(key)
             lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("font-size: 9pt; color: #555;")
+            lbl.setStyleSheet("font-size: 9pt;")
 
             le = QtWidgets.QLineEdit(f"{self.gains[key]:g}")
             le.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
@@ -1384,7 +1361,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
 
             lbl = QtWidgets.QLabel(key)
             lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("font-size: 9pt; color: #555;")
+            lbl.setStyleSheet("font-size: 9pt;")
 
             le = QtWidgets.QLineEdit(f"{self.obs_gains[key]:g}")
             le.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
@@ -1404,6 +1381,25 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self.btn_send_obs.clicked.connect(self._on_send_obs)
         v.addWidget(self.btn_send_obs)
 
+        return g
+
+    def _crear_grupo_apariencia(self):
+        g = QtWidgets.QGroupBox("Apariencia")
+        h = QtWidgets.QHBoxLayout(g)
+        h.setContentsMargins(8, 4, 8, 4)
+        h.setSpacing(8)
+
+        h.addWidget(QtWidgets.QLabel("Modo Batman"))
+        h.addStretch()
+
+        self.toggle_batman = ToggleSwitch()
+        self.toggle_batman.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.toggle_batman.setToolTip(
+            "Activa la paleta oscura «Modo Batman».\n"
+            "Desactivalo para volver al modo claro."
+        )
+        self.toggle_batman.toggled.connect(self._on_batman_toggled)
+        h.addWidget(self.toggle_batman)
         return g
 
     # ---- Grupo: grabación ----
@@ -2001,6 +1997,33 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self._on_mode_changed("STANDBY")
         self._set_motor_moving(False)
 
+    def _on_batman_toggled(self, activo: bool):
+        """Cambia toda la paleta de colores (claro <-> Batman)."""
+        # 1) Gráficas (fondo, ejes, títulos y color de traza)
+        for panel in self._paneles_graficas.values():
+            panel.set_theme(activo)
+        self.panel_fase.set_theme(activo)
+
+        # 2) Hoja de estilos global del QMainWindow
+        self.setStyleSheet(ESTILO_GLOBAL_BATMAN if activo else ESTILO_GLOBAL_CLARO)
+
+        # 3) Botones "Enviar" (usan hoja propia, no la global)
+        estilo_enviar = ESTILO_ENVIAR_BATMAN if activo else ESTILO_ENVIAR_CLARO
+        for btn in (self.btn_exc_start, self.btn_send_gains,
+                    self.btn_send_wmaxi, self.btn_send_obs, self.btn_apply_est):
+            btn.setStyleSheet(estilo_enviar)
+
+        # 4) Avisos rojo-oscuro: sobre fondo negro casi no se leen
+        aviso = "#ff5252" if activo else "#b00"
+        self.lbl_ol_aviso.setStyleSheet(f"color: {aviso}; font-size: 9pt;")
+        self.lbl_gains_lock.setStyleSheet(f"color: {aviso}; font-size: 9pt;")
+
+        # 5) Config global de pyqtgraph (por si se crean más plots en el futuro)
+        pg.setConfigOptions(
+            background='#121212' if activo else 'w',
+            foreground='#e0e0e0' if activo else 'k',
+        )
+
     def _on_toggle_record(self):
         if not self.recording:
             self.recording = True
@@ -2100,9 +2123,12 @@ class InterfazPendulo(QtWidgets.QMainWindow):
 #  Entry point
 # =====================================================================
 def main():
-    pg.setConfigOptions(antialias=False, background='w', foreground='k')
+    pg.setConfigOptions(antialias=False, background='#121212', foreground='#e0e0e0')
 
     app = QtWidgets.QApplication(sys.argv)
+
+    app.setStyle("Fusion")
+    
     ventana = InterfazPendulo()
     ventana.show()
     sys.exit(app.exec())
