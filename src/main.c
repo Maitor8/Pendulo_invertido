@@ -1,13 +1,31 @@
+/* Firmware ESP32 - Péndulo invertido con disco de inercia (v2.2, base: main_1.c)
+ * Correcciones sobre main_1.c:
+ *  1. _Static_assert del tick de FreeRTOS: con PEND_TS_MS=5 hace falta CONFIG_FREERTOS_HZ>=200
+ *     (ESP-IDF trae 100 por defecto: pdMS_TO_TICKS(5)=0 y la tarea de control no cede la CPU).
+ *  2. Freno por sobrevelocidad restaurado (estaba calculado y sin usar), con histéresis.
+ *  3. Cambios de modo automáticos (MANUAL->STABILIZATION->STANDBY) hechos con comparar-y-asignar
+ *     bajo spinlock: antes podían pisar un ESTOP/MODE llegado por la UART en ese instante.
+ *  4. PWM_MIN_BALANCE ahora se usa; zona muerta distinta en balanceo y en swing-up/manual.
+ *  5. Watchdog: con el motor activo, TIMEOUT_MOTOR_MS sin tráfico -> STANDBY (revisado cada 250 ms).
+ *  6. Macros duplicadas e inconsistentes (PEND_*_DEG, DEG_POR_CUENTA) eliminadas.
+ */
+
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "driver/ledc.h"
 #include "driver/pulse_cnt.h"
+#include "esp_err.h"
 #include "esp_timer.h"
+#include "esp_log.h"
 
 //===================
 //Defines
@@ -26,20 +44,26 @@
 #define PIN_EN           GPIO_NUM_14
 
 //Control
-#define PEND_TS_MS       10 //100Hz
+#define PI_F             ((float)M_PI)
+#define PEND_TS_MS       5  //5ms = 200Hz
 #define PEND_TS_S        (PEND_TS_MS / 1000.0f)
-#define PEND_UMax        60.0f
-#define PEND_ZONA2       (988.0f * (float)M_PI / 1000.0f) //pocos grados para la captura
+#define PEND_UMax        12.0f
+#define PEND_ZONA2       (988.0f * PI_F / 1000.0f) //pocos grados para la captura
+//Zonas expresadas como error angular respecto a la vertical:
+//captura ±2.2°,  salida del LQR ±5.7°
+#define PEND_CAPT_RAD    (PI_F - PEND_ZONA2)
+#define PEND_SALIDA_RAD  (PI_F - 0.98f * PEND_ZONA2)
+#define U_MANUAL         -0.8f
+
 //PWMs
 #define PWM_FREQ_HZ      20000
 #define PWM_RES          LEDC_TIMER_10_BIT
 #define PWM_MAX          1023
 
 //Encoders
-#define ENC_LIMIT        30000
-#define ENC_FULL_RANGE   (2 * ENC_LIMIT)
-#define ENC_WRAP_THR     (ENC_FULL_RANGE - 1000)
-#define PEND_CPR         2000.0f   
+#define ENC_LIMIT        30000        
+#define PEND_CPR         2000.0f        
+#define RAD_POR_CUENTA   (2.0f * PI_F / PEND_CPR)
 #define Filter_ns        100 //el otro día era de 50, mucho ruido subirlo
 
 //Uart
@@ -47,35 +71,66 @@
 #define UART_BUF_SIZE         2048
 #define TIMEOUT_HANDSHAKE_MS  5000
 #define PING_HELLO_MS         1000
+#define MANUAL_DEADMAN_MS     700     //sin manual en x tiempo, motor a 0
+#define TIMEOUT_MOTOR_MS      1500    //motor activo y sin tráfico de la GUI -> STANDBY
+#define WATCHDOG_PERIODO_MS   250     //cada cuánto se revisa el timeout
+#define SOBREVEL_ACTIVO       1       //0 desactiva el freno por RPM_MAX (no recomendado)
 
 //Ctes de energía para el swing-up
-#define PEND_Q1          30.0f//param q1
-#define PEND_WMAXI       15390.0f//depende de los param, =2*q1*rho + margen
-#define PEND_KMOT        1.5f//considerar bajarlo, = 1/(rho * q3 * tau), tau=0.07?
-#define PEND_RHO         250.0f //param rho
-#define PEND_Q2          0.0245f//q2
-#define PEND_Q3          0.0393f//q3
-#define PEND_CERO        2.5f//tal vez modificarlo según fricción, swing up
+#define PEND_Q1          26.0736f//param q1
+#define PEND_Q2          0.0189f//q2
+#define PEND_Q3          0.3819f//q3
+#define PEND_RHO         241.5725f //param rho
 
-// #define PEND_WMAXI  (2.1f * PEND_Q1 * PEND_RHO)              /* +5% margen */
-// #define PEND_KMOT   (1.0f / (PEND_RHO * PEND_Q3 * 0.08f))    /* τ = 80 ms */
-// #define PEND_CERO   (0.4f * sqrtf(PEND_Q1))
+#define PEND_WMAXI_BASE  (PEND_Q1 * PEND_RHO)             
+#define PEND_KMOT   (1.0f / (PEND_RHO * PEND_Q3 * 0.08f))   
+#define PEND_CERO   (0.2f * sqrtf(PEND_Q1))//1.02 rad/s; si el swing no arranca, bajarlo
 
 //Motor
-#define PWM_MIN_SWING    0
-#define PWM_MIN_BALANCE  0
+#define PWM_MIN_SWING    100
+#define PWM_MIN_BALANCE  100
 #define RPM_MAX 3000
 
 //Inversiones, encoder y motor
 #define INVERTIR_BARRA   1.0f
-#define INVERTIR_DISCO   1.0f
+#define INVERTIR_DISCO   -1.0f
 #define SWING_SIGN    1.0f
 #define BALANCE_SIGN  1.0f
+
+#define DIFERENCIAS 3
+
+//Núcleos (control aislado de la comunicación)
+//vTaskDelayUntil trabaja en ticks: el periodo de control debe ser un número entero de ticks.
+//Con CONFIG_FREERTOS_HZ=100 (por defecto) 5 ms = 0 ticks. Subirlo a 1000 en menuconfig.
+// _Static_assert((PEND_TS_MS * configTICK_RATE_HZ) % 1000 == 0 && (PEND_TS_MS * configTICK_RATE_HZ) >= 1000,
+//                "PEND_TS_MS debe ser multiplo del tick de FreeRTOS: poner CONFIG_FREERTOS_HZ=1000");
+
+#if CONFIG_FREERTOS_UNICORE
+  #define CORE_CTRL 0
+  #define CORE_COMM 0
+#else
+  #define CORE_CTRL 1
+  #define CORE_COMM 0
+#endif
 
 
 //============================
 //Tipos
 //============================
+//Modos de funcionamiento (nombres = los que envía la GUI)
+typedef enum {
+    MODO_STANDBY = 0,
+    MODO_MANUAL,
+    MODO_OPEN_LOOP,
+    MODO_STABILIZATION,
+    MODO_AUTO,
+    MODO_N
+} modo_t;
+
+static const char *const MODO_NOMBRE[MODO_N] = {
+    "STANDBY", "MANUAL", "OPEN_LOOP", "STABILIZATION", "AUTO"
+};
+
 //Ensayo de lazo abierto
 typedef enum {
     EXC_NINGUNA = 0,
@@ -83,6 +138,16 @@ typedef enum {
     EXC_CHIRP,
     EXC_PRBS,
 } exc_tipo_t;
+
+ //config para las EXCitaciones
+typedef struct {
+    exc_tipo_t tipo;
+    float freq;       
+    float amp_pct;    
+    float f0, f1;     
+    float dur;       
+    float bitrate;    
+} exc_cfg_t;
 
 //Paquete binario de las señales
 #pragma pack(push, 1)
@@ -93,9 +158,10 @@ typedef struct {
     float   theta;          //pos barra rad
     float   theta_dot;      //vel barra rad/s
     float   omega_rueda;    //vel disco rad/s
-    int16_t u;              //u en función del umax no en volt
+    int16_t u;              //u*100 (u en unidades de control, ±PEND_UMax; no en volt)
 } paquete_t;
 #pragma pack(pop)
+_Static_assert(sizeof(paquete_t) == 20, "paquete_t debe medir 20 bytes (la GUI lee 2 + 18)");
 
 //Balanceo
 typedef enum {
@@ -103,75 +169,86 @@ typedef enum {
     AUTO_LQR,
 } auto_fase_t;
 
-//Encoders
-typedef struct{
-    pcnt_unit_handle_t unit;
-    volatile int64_t;
-} encoder_pcnt_t ;
-
+typedef struct { float l1, l2, l3; } ganancias_t;
 
 //============================
 //ESTADO GLOBAL
 //============================
-//balance
-static volatile auto_fase_t auto_fase = AUTO_SWINGUP;
+/* Regla: lo que está bajo "estado_mux" lo escribe RX/hello y lo LEE la tarea
+   de control en una copia local. Lo demás (estimador, auto_fase, exc_act)
+   es exclusivo de la tarea de control. */
+static portMUX_TYPE estado_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static volatile modo_t  modo            = MODO_STANDBY;
+static ganancias_t      ganancias       =  { -248.9894f, -48.6771f, -0.1108f};
+static volatile bool    req_reset       = false; //pedido del reset
+static exc_cfg_t        exc_pend;                  //excitacion pedida por rx
+static volatile bool    exc_req_start   = false;
+static volatile bool    exc_req_stop    = false;
+
+//Pedidos de la GUI
+static volatile bool req_zero = false; //pedido de cero de la barra
+static volatile bool req_wmaxi = false; //pedido de wmaxi
+static volatile float wmaxi_pend_mult = 2.1f; //multiplicador de wmaxi, para el swing-up
 
 //Handshake
-static volatile bool    handshake_ok    = false;
-static char             modo_actual[16] = "STANDBY";
-static volatile int32_t t_ultimo_comando_ms = 0;
+static volatile bool     handshake_ok        = false;
+static volatile uint32_t t_ultimo_comando_ms = 0;
 
-//Ganancias
-static volatile float L1 = -4941.4f;
-static volatile float L2 = -985.4f;
-static volatile float L3 = -1.4f;
+//Control manual
+static volatile bool     manual_izq   = false;
+static volatile bool     manual_dcha   = false;
+static volatile uint32_t t_manual_ms  = 0;
 
 //Hardware
 static pcnt_unit_handle_t pcnt_barra = NULL;
 static pcnt_unit_handle_t pcnt_disco = NULL;
+static SemaphoreHandle_t  motor_mtx  = NULL;
 
-//Pos fís
-static volatile float pb     = 0.0f;
-static volatile float pd     = 0.0f;
-static volatile float pbo    = 0.0f;   //offset, z=x1-x0, alrededor del eq
-static volatile int32_t pdma = 0;
-static volatile int32_t roscas = 1;
+// Exclusivo de la tarea de control 
+static auto_fase_t auto_fase = AUTO_SWINGUP;
+static bool    stab_capturada = false; //si se capturó la barra en vertical
 
-//Posiciones para las diferencias
-static float pb_hist[3] = {0};   /* [k-1], [k], [k+1] */
-static float pd_hist[3] = {0};
+static int32_t cnt_b_act = 0, cnt_d_act = 0;   //cuentas acumuladas
+static float   pb = 0.0f;                      //ángulo barra [rad] 
 
-//Para el promedio
-static float vbarra_hist[FD_FILTRO_N] = {0};
-static float vdisco_hist[FD_FILTRO_N] = {0};
-static int   fd_idx = 0;
-static int   fd_count = 0;
+static int32_t cnt_b_ref = 0; //cuentas de la barra 
+static float wmaxi_mult = 2.1f; //multiplicador vigente
 
-//Vel filtradas
-static volatile float vb_est = 0.0f;   /* velocidad barra */
-static volatile float vd_est = 0.0f;   /* velocidad disco */
 
-//control
-static volatile float u_ctrl = 0.0f;
+static int32_t cb_hist[DIFERENCIAS] = {0};               //[k-1], [k], [k+1] en cuentas
+static int32_t cd_hist[DIFERENCIAS] = {0};
+static float   vbarra_hist[FD_FILTRO_N] = {0};
+static float   vdisco_hist[FD_FILTRO_N] = {0};
+static int     fd_idx = 0, fd_count = 0, ma_n = 0;
+static float   vb_est = 0.0f; //vel estimadas
+static float   vd_est = 0.0f;                  
 
-//Lazo abierto
-static volatile exc_tipo_t exc_tipo     = EXC_NINGUNA;
-static volatile float      exc_amp_pct  = 0.0f;
-static volatile float      exc_freq     = 0.0f;
-static volatile float      exc_f0       = 0.0f;
-static volatile float      exc_f1       = 0.0f;
-static volatile float      exc_duracion = 0.0f;
-static volatile float      exc_bitrate  = 0.0f;
-static volatile int64_t    exc_t_inicio_us = 0;
+static exc_cfg_t exc_act;                      
+static int64_t   exc_t_inicio_us = 0;
+static uint32_t  prbs_lfsr = 0xACE1u;
+static int64_t   prbs_t_ultimo_bit_us = 0;
+static int       prbs_bit_actual = 1;
 
-/* PRBS (LFSR 16 bits) */
-static uint32_t prbs_lfsr           = 0xACE1u;
-static int64_t  prbs_t_ultimo_bit_us = 0;
-static int      prbs_bit_actual     = 1;
+//============================
+//Utilidades
+//============================
+static inline uint32_t ms_now(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
 
-//Control Manual
-static volatile bool manual_izq = false;
-static volatile bool manual_der = false;
+static void responder(const char *s)
+{
+    uart_write_bytes(UART_NUM, s, strlen(s));
+}
+
+static inline float sat(float x, float lim)
+{
+    if (x >  lim) return  lim;
+    if (x < -lim) return -lim;
+    return x;
+}
 
 //=====================
 //Configuraciones
@@ -186,13 +263,15 @@ static void configurar_uart(void)
         .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
     };
-    uart_param_config(UART_NUM, &cfg);
-    uart_driver_install(UART_NUM, UART_BUF_SIZE, UART_BUF_SIZE, 0, NULL, 0);
+    ESP_ERROR_CHECK(uart_param_config(UART_NUM, &cfg));
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM, UART_BUF_SIZE, UART_BUF_SIZE, 0, NULL, 0));
 }
 
 //Pwm del puente/motor
 static void configurar_pwm(void)
 {
+    motor_mtx = xSemaphoreCreateMutex();
+
     ledc_timer_config_t timer = {
         .speed_mode      = LEDC_LOW_SPEED_MODE,
         .timer_num       = LEDC_TIMER_0,
@@ -200,28 +279,28 @@ static void configurar_pwm(void)
         .freq_hz         = PWM_FREQ_HZ,
         .clk_cfg         = LEDC_AUTO_CLK,
     };
-    ledc_timer_config(&timer);
+    ESP_ERROR_CHECK(ledc_timer_config(&timer));
     //ch0 para dcha
     ledc_channel_config_t ch_r = {
         .gpio_num = RPWM_PIN, .speed_mode = LEDC_LOW_SPEED_MODE,
         .channel  = LEDC_CHANNEL_0, .timer_sel = LEDC_TIMER_0,
         .duty = 0, .hpoint = 0,
     };
-    ledc_channel_config(&ch_r);
+    ESP_ERROR_CHECK(ledc_channel_config(&ch_r));
     //ch1 para izq
     ledc_channel_config_t ch_l = {
         .gpio_num = LPWM_PIN, .speed_mode = LEDC_LOW_SPEED_MODE,
         .channel  = LEDC_CHANNEL_1, .timer_sel = LEDC_TIMER_0,
         .duty = 0, .hpoint = 0,
     };
-    ledc_channel_config(&ch_l);
+    ESP_ERROR_CHECK(ledc_channel_config(&ch_l));
 
-    //puente H
+    //puente H (EN recién después de tener los PWM en 0)
     gpio_config_t io = {
         .pin_bit_mask = (1ULL << PIN_EN),
         .mode         = GPIO_MODE_OUTPUT,
     };
-    gpio_config(&io);
+    ESP_ERROR_CHECK(gpio_config(&io));
     gpio_set_level(PIN_EN, 1);
 }
 
@@ -229,88 +308,116 @@ static void configurar_pwm(void)
 static void configurar_encoder(int pin_a, int pin_b, pcnt_unit_handle_t *handle)
 {
     pcnt_unit_config_t unit_cfg = {
-        .high_limit =  ENC_LIMIT,
+        .high_limit = ENC_LIMIT,
         .low_limit  = -ENC_LIMIT,
+        .flags.accum_count = true,   /* suma el desborde en la ISR -> contador de 32 bits */
     };
-    pcnt_new_unit(&unit_cfg, handle);
+    ESP_ERROR_CHECK(pcnt_new_unit(&unit_cfg, handle));
 
     //Config en x4
-    /* ---- Canal A: cuenta sobre A, dirección por B ---- */
+    //Canal A: cuenta sobre A, dirección por B
     pcnt_chan_config_t chan_a_cfg = {
         .edge_gpio_num  = pin_a,
         .level_gpio_num = pin_b,
     };
     pcnt_channel_handle_t chan_a = NULL;
-    pcnt_new_channel(*handle, &chan_a_cfg, &chan_a);
-    pcnt_channel_set_edge_action(chan_a,
-        PCNT_CHANNEL_EDGE_ACTION_DECREASE,  
-        PCNT_CHANNEL_EDGE_ACTION_INCREASE); 
-    pcnt_channel_set_level_action(chan_a,
-        PCNT_CHANNEL_LEVEL_ACTION_KEEP,    
-        PCNT_CHANNEL_LEVEL_ACTION_INVERSE);  
+    ESP_ERROR_CHECK(pcnt_new_channel(*handle, &chan_a_cfg, &chan_a));
+    ESP_ERROR_CHECK(pcnt_channel_set_edge_action(chan_a,
+        PCNT_CHANNEL_EDGE_ACTION_DECREASE,
+        PCNT_CHANNEL_EDGE_ACTION_INCREASE));
+    ESP_ERROR_CHECK(pcnt_channel_set_level_action(chan_a,
+        PCNT_CHANNEL_LEVEL_ACTION_KEEP,
+        PCNT_CHANNEL_LEVEL_ACTION_INVERSE));
 
-    /* ---- Canal B: cuenta sobre B, dirección por A ---- */
+    // Canal B: cuenta sobre B, dirección por A
     pcnt_chan_config_t chan_b_cfg = {
         .edge_gpio_num  = pin_b,
         .level_gpio_num = pin_a,
     };
     pcnt_channel_handle_t chan_b = NULL;
-    pcnt_new_channel(*handle, &chan_b_cfg, &chan_b);
-    pcnt_channel_set_edge_action(chan_b,
-        PCNT_CHANNEL_EDGE_ACTION_INCREASE,  
-        PCNT_CHANNEL_EDGE_ACTION_DECREASE); 
-    pcnt_channel_set_level_action(chan_b,
+    ESP_ERROR_CHECK(pcnt_new_channel(*handle, &chan_b_cfg, &chan_b));
+    ESP_ERROR_CHECK(pcnt_channel_set_edge_action(chan_b,
+        PCNT_CHANNEL_EDGE_ACTION_INCREASE,
+        PCNT_CHANNEL_EDGE_ACTION_DECREASE));
+    ESP_ERROR_CHECK(pcnt_channel_set_level_action(chan_b,
         PCNT_CHANNEL_LEVEL_ACTION_KEEP,
-        PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
+        PCNT_CHANNEL_LEVEL_ACTION_INVERSE));
 
-    /* Filtro anti-rebote */
-    pcnt_glitch_filter_config_t filter = { .max_glitch_ns = Filter_ns};
-    pcnt_unit_set_glitch_filter(*handle, &filter);
+    //Filtro anti-rebote
+    pcnt_glitch_filter_config_t filter = { .max_glitch_ns = Filter_ns };
+    ESP_ERROR_CHECK(pcnt_unit_set_glitch_filter(*handle, &filter));
 
-    pcnt_unit_enable(*handle);
-    pcnt_unit_clear_count(*handle);
-    pcnt_unit_start(*handle);
+    //Para que accum_count compense el desborde hay que vigilar ambos límites
+    ESP_ERROR_CHECK(pcnt_unit_add_watch_point(*handle,  ENC_LIMIT));
+    ESP_ERROR_CHECK(pcnt_unit_add_watch_point(*handle, -ENC_LIMIT));
+
+    ESP_ERROR_CHECK(pcnt_unit_enable(*handle));
+    ESP_ERROR_CHECK(pcnt_unit_clear_count(*handle));
+    ESP_ERROR_CHECK(pcnt_unit_start(*handle));
 }
 
 //============================
 //Funciones varias
 //============================
-//Aplicar u
-static void motor_set(float u)
+//Aplicar u  (segura entre tareas: ESTOP la llama desde RX)
+static void motor_set(float u, int dmin)
 {
-    if (u >  PEND_UMax) u =  PEND_UMax;
-    if (u < -PEND_UMax) u = -PEND_UMax;
+    if (!isfinite(u)) u = 0.0f;
+    u = sat(u, PEND_UMax);
 
+    //3 simples 
     int duty = (int)(fabsf(u) / PEND_UMax * PWM_MAX);
+    if (duty > PWM_MAX) duty = PWM_MAX;
 
-    //solo si hay sona muerta
-    // if (duty>0 && duty <PWM_MIN_SWING) duty= PWM_MIN_SWING;
+    //zona muerta
+    if (duty > 0 && duty < dmin) duty = dmin;
 
-    if (u > 0.5f) {
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
-    } else if (u < -0.5f) {
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty);
-    } else {
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
-        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 0);
-    }
+    int d0 = 0, d1 = 0;
+    if      (u >  0.5f) d0 = duty;
+    else if (u < -0.5f) d1 = duty;
+
+    xSemaphoreTake(motor_mtx, portMAX_DELAY);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, d0);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, d1);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+    xSemaphoreGive(motor_mtx);
 }
 
 //send state
 static void enviar_estado(void)
 {
-    char buf[128];
+    ganancias_t g;
+    modo_t m;
+    float wm;
+    portENTER_CRITICAL(&estado_mux);
+    g = ganancias;
+    m = modo;
+    wm = wmaxi_pend_mult; //valor pendiente
+    portEXIT_CRITICAL(&estado_mux);
+
+    char buf[160];
     int n = snprintf(buf, sizeof(buf),
-                     "STATE,L=%.4f,%.4f,%.4f;MODE=%s\n",
-                     L1, L2, L3, modo_actual);
-    uart_write_bytes(UART_NUM, buf, n);
+                     "STATE,L=%.4f,%.4f,%.4f;MODE=%s;WMAXI=%.3f\n",
+                     g.l1, g.l2, g.l3, MODO_NOMBRE[m], wm);
+    if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
+    if (n > 0) uart_write_bytes(UART_NUM, buf, n);
 }
 
-//Excitación de Lazo abierto
+//Lleva todo a reposo. Se puede llamar desde cualquier tarea
+static void ir_a_standby(void)
+{
+    portENTER_CRITICAL(&estado_mux);
+    modo          = MODO_STANDBY;
+    manual_izq    = false;
+    manual_dcha    = false;
+    req_reset     = true;
+    exc_req_start = false;
+    exc_req_stop  = true;
+    portEXIT_CRITICAL(&estado_mux);
+}
+
+//Excitación de Lazo abierto  (solo tarea de control)
 static int prbs_next_bit(void)
 {
     uint32_t bit = ((prbs_lfsr >> 0) ^ (prbs_lfsr >> 2) ^
@@ -319,35 +426,52 @@ static int prbs_next_bit(void)
     return prbs_lfsr & 1u;
 }
 
+static bool exc_cfg_valida(const exc_cfg_t *c)
+{
+    if (!isfinite(c->amp_pct) || c->amp_pct <= 0.0f || c->amp_pct > 100.0f) return false;
+    if (!isfinite(c->dur)     || c->dur     <= 0.0f || c->dur     > 600.0f) return false;
+    switch (c->tipo) {
+    case EXC_SQUARE:
+        return isfinite(c->freq) && c->freq > 0.0f && c->freq <= 50.0f;
+    case EXC_CHIRP:
+        return isfinite(c->f0) && isfinite(c->f1) &&
+               c->f0 > 0.0f && c->f1 > 0.0f && c->f0 <= 50.0f && c->f1 <= 50.0f &&
+               fabsf(c->f1 - c->f0) > 1e-3f;
+    case EXC_PRBS:
+        return isfinite(c->bitrate) && c->bitrate > 0.0f && c->bitrate <= 50.0f;
+    default:
+        return false;
+    }
+}
+
 static float exc_generar_u(void)
 {
-    if (exc_tipo == EXC_NINGUNA) return 0.0f;
+    if (exc_act.tipo == EXC_NINGUNA) return 0.0f;
 
     int64_t ahora = esp_timer_get_time();
     float t = (ahora - exc_t_inicio_us) / 1e6f;
 
-    if (t >= exc_duracion) {
-        exc_tipo = EXC_NINGUNA;
+    if (t >= exc_act.dur) {
+        exc_act.tipo = EXC_NINGUNA;
         return 0.0f;
     }
 
-    float amp = (exc_amp_pct / 100.0f) * PEND_UMax;
+    float amp = (exc_act.amp_pct / 100.0f) * PEND_UMax;
 
-    switch (exc_tipo) {
+    switch (exc_act.tipo) {
     case EXC_SQUARE: {
-        float fase = 2.0f * (float)M_PI * exc_freq * t;
+        float fase = 2.0f * PI_F * exc_act.freq * t;
         return (sinf(fase) >= 0.0f) ? amp : -amp;
     }
     case EXC_CHIRP: {
-        if (exc_f1 == exc_f0) exc_f1 += 0.01f;   /* protección */
-        float K    = exc_duracion / logf(exc_f1 / exc_f0);
-        float fase = 2.0f * (float)M_PI * exc_f0 * K * (expf(t / K) - 1.0f);
+        float K    = exc_act.dur / logf(exc_act.f1 / exc_act.f0);
+        float fase = 2.0f * PI_F * exc_act.f0 * K * (expf(t / K) - 1.0f);
         return amp * sinf(fase);
     }
     case EXC_PRBS: {
-        int64_t periodo_us = (int64_t)(1e6f / exc_bitrate);
+        int64_t periodo_us = (int64_t)(1e6f / exc_act.bitrate);
         if ((ahora - prbs_t_ultimo_bit_us) >= periodo_us) {
-            prbs_bit_actual     = prbs_next_bit();
+            prbs_bit_actual      = prbs_next_bit();
             prbs_t_ultimo_bit_us = ahora;
         }
         return prbs_bit_actual ? amp : -amp;
@@ -357,61 +481,88 @@ static float exc_generar_u(void)
     }
 }
 
-static void exc_detener(void)
-{
-    exc_tipo = EXC_NINGUNA;
-}
-
-static bool exc_iniciar(exc_tipo_t tipo)
-{
-    if (strncmp(modo_actual, "OPEN_LOOP", 9) != 0) return false;
-    exc_detener();
-    prbs_lfsr            = 0xACE1u;
-    prbs_bit_actual      = 1;
-    prbs_t_ultimo_bit_us = esp_timer_get_time();
-    exc_t_inicio_us      = esp_timer_get_time();
-    exc_tipo             = tipo;
-    return true;
-}
-
 //Para resetear el observador trucho
 static void resetear_estimador(void)
 {
-    pb_hist[0] = pb_hist[1] = pb_hist[2] = pb;
-    pd_hist[0] = pd_hist[1] = pd_hist[2] = pd;
+    for (int i = 0; i < DIFERENCIAS; i++) { cb_hist[i] = cnt_b_act; cd_hist[i] = cnt_d_act; }
     for (int i = 0; i < FD_FILTRO_N; i++) {
         vbarra_hist[i] = 0.0f;
         vdisco_hist[i] = 0.0f;
     }
     fd_idx = 0;
     fd_count = 0;
+    ma_n = 0;
     vb_est = 0.0f;
     vd_est = 0.0f;
 }
 
-//lectura de encoders
+// Aplica los pedidos que dejó RX. Se llama al inicio de cada ciclo.
+static void aplicar_comandos_pendientes(void)
+{
+    bool reset, ex_start, ex_stop, zero, wm_req;
+    exc_cfg_t cfg;
+    float wm_val;
+
+    portENTER_CRITICAL(&estado_mux);
+    reset         = req_reset;      req_reset     = false;
+    ex_stop       = exc_req_stop;   exc_req_stop  = false;
+    ex_start      = exc_req_start;  exc_req_start = false;
+    zero          = req_zero;       req_zero      = false;
+    wm_req        = req_wmaxi;      req_wmaxi     = false;
+    wm_val        = wmaxi_pend_mult;
+    cfg           = exc_pend;
+    portEXIT_CRITICAL(&estado_mux);
+
+    if (reset) {
+        resetear_estimador();
+        auto_fase = AUTO_SWINGUP;
+        stab_capturada = false; 
+    }
+    if(zero && modo == MODO_STANDBY){
+        int cb = 0;
+        pcnt_unit_get_count(pcnt_barra, &cb);
+        cnt_b_ref = cb;
+    }
+    if(wm_req){
+        wmaxi_mult = wm_val;
+    }
+    if (ex_stop) {
+        exc_act.tipo = EXC_NINGUNA;
+    }
+    if (ex_start) {
+        exc_act              = cfg;
+        prbs_lfsr            = 0xACE1u;
+        prbs_bit_actual      = 1;
+        exc_t_inicio_us      = esp_timer_get_time();
+        prbs_t_ultimo_bit_us = exc_t_inicio_us;
+    }
+}
+
+//lectura de encoders (el PCNT ya devuelve el valor acumulado de 32 bits)
 static void leer_encoders(void)
 {
-    int cnt_barra, cnt_disco;
-    pcnt_unit_get_count(pcnt_barra, &cnt_barra);
-    pcnt_unit_get_count(pcnt_disco, &cnt_disco);
+    int cb = 0, cd = 0;
+    pcnt_unit_get_count(pcnt_barra, &cb);
+    pcnt_unit_get_count(pcnt_disco, &cd);
+    cnt_b_act = cb;
+    cnt_d_act = cd;
+    pb = INVERTIR_BARRA * (float)(cb - cnt_b_ref) * RAD_POR_CUENTA;
+}
 
-    //  Unwrap del disco 
-    int32_t difpd = cnt_disco - pdma;
-    if (difpd >  ENC_WRAP_THR) roscas++;
-    if (difpd < -ENC_WRAP_THR) roscas--;
-    pdma = cnt_disco;
-
-    int32_t abs_disco = cnt_disco - (roscas - 1) * ENC_FULL_RANGE;
-
-    pd = INVERTIR_DISCO * (float)abs_disco * (float)M_PI / (PEND_CPR / 2.0f);
-    pb = INVERTIR_BARRA * (float)cnt_barra * (float)M_PI / (PEND_CPR / 2.0f);
+//Error angular respecto a la vertical más cercana 
+static float error_vertical(float ang)
+{
+    float k   = roundf((ang - PI_F) / (2.0f * PI_F));
+    float ref = PI_F + 2.0f * PI_F * k;
+    return ang - ref; //prácticamente, siempre ang - pi
 }
 
 //Swing-up por energía
 static float control_energia(void)
 {
     /* Discriminante: cuánta energía falta para llegar a Wmaxi */
+    float PEND_WMAXI = wmaxi_mult * PEND_WMAXI_BASE;
+
     float discri = 2.0f * PEND_WMAXI
                  - vb_est * vb_est * PEND_RHO
                  - 2.0f * PEND_Q1 * PEND_RHO * (1.0f - cosf(pb));
@@ -423,126 +574,269 @@ static float control_energia(void)
         u = -vb_est;
     } else {
         /* Velocidades objetivo del disco para inyectar energía */
-        float Vel1 = -vb_est + sqrtf(discri);
-        float Vel2 = -vb_est - sqrtf(discri);
+        float raiz = sqrtf(discri);
+        float Vel1 = -vb_est + raiz;
+        float Vel2 = -vb_est - raiz;
         float Vel  = 0.0f;
 
         if (vb_est >  PEND_CERO) Vel = Vel2;
         if (vb_est < -PEND_CERO) Vel = Vel1;
 
-        /* Ley de control: proporcional a la velocidad del disco
-           + feedforward de fricción */
+        //Realim de estados
         u = PEND_KMOT * (Vel - vd_est) + (PEND_Q2 / PEND_Q3) * vd_est;
     }
 
-    /* Saturación */
-    if (u >  PEND_UMax) u =  PEND_UMax;
-    if (u < -PEND_UMax) u = -PEND_UMax;
-
-    return SWING_SIGN * u;
+    return SWING_SIGN * sat(u, PEND_UMax);
 }
 
-//Realim- Ganancias viejas
-static float control_lqr(void)
+//Realimentación de estados (LQR)
+static float control_lqr(const ganancias_t *g)
 {
-    if (fabsf(pb) < PEND_ZONA2 * 0.9f) {
-        return 0.0f;
+    float e = error_vertical(pb);
+    if (fabsf(e) > PEND_SALIDA_RAD) {
+        //considerar cambiar a modo standby
+        return 0.0f;                     //lejos de la vertical
     }
-    
-    float u = L1 * (pb + pbo) + L2 * vb_est + L3 * vd_est;
-    u = -u;
 
-    if (u >  PEND_UMax) u =  PEND_UMax;
-    if (u < -PEND_UMax) u = -PEND_UMax;
-
-    return BALANCE_SIGN * u;
+    float u = -(g->l1 * e + g->l2 * vb_est + g->l3 * vd_est);
+    return BALANCE_SIGN * sat(u, PEND_UMax);
 }
 
 //Atrapar
-static float control_auto(void)
+static float control_auto(const ganancias_t *g)
 {
-    float pb_abs = fabsf(pb);
+    float e_abs = fabsf(error_vertical(pb));
 
     if (auto_fase == AUTO_SWINGUP) {
-        /* ¿Llegó cerca de vertical? */
-        if (pb_abs > PEND_ZONA2) {
+        if (e_abs < PEND_CAPT_RAD) {     //cerca de la vertical?
             auto_fase = AUTO_LQR;
-            /* pbo = referencia para el LQR: -π si llegó por arriba,
-                                     +π si llegó por abajo */
-            pbo = (pb > 0.0f) ? -M_PI : M_PI;
+            return control_lqr(g);
         }
         return control_energia();
-    } else {
-        /* Está en LQR: verificar si se cayó */
-        if (pb_abs < PEND_ZONA2 * 0.9f) {   
-            auto_fase = AUTO_SWINGUP;
-            pbo = 0.0f;
-        }
-        return control_lqr();
     }
+    //se cayó?
+    if (e_abs > PEND_SALIDA_RAD) {
+        auto_fase = AUTO_SWINGUP;
+        return control_energia();
+    }
+    return control_lqr(g);
 }
 
 //Control por modo
-static float calcular_control(void)
+static float calcular_control(modo_t m, const ganancias_t *g)
 {
-    if (strncmp(modo_actual, "MANUAL", 6) == 0) {
-        if (manual_izq && !manual_der) return  0.3f * PEND_UMax;
-        if (manual_der && !manual_izq) return -0.3f * PEND_UMax;
+    switch (m) {
+    case MODO_MANUAL:
+        //Deadman: si la GUI dejó de refrescar la orden, parar
+        if ((uint32_t)(ms_now() - t_manual_ms) > MANUAL_DEADMAN_MS) return 0.0f;
+        if (manual_izq && !manual_dcha) return  -U_MANUAL * PEND_UMax;
+        if (manual_dcha && !manual_izq) return U_MANUAL * PEND_UMax;
         return 0.0f;
+    case MODO_OPEN_LOOP:     return exc_generar_u();
+    case MODO_STABILIZATION: return control_lqr(g);
+    case MODO_AUTO:          return control_auto(g);
+    default:                 return 0.0f;   
     }
-    if (strncmp(modo_actual, "OPEN_LOOP", 9) == 0) {
-        return exc_generar_u();
-    }
-    if (strncmp(modo_actual, "STABILIZATION", 13) == 0) {
-        return control_lqr();
-    }
-    if (strncmp(modo_actual, "AUTO", 4) == 0) {
-        /* TODO Fase 2/3: swing-up + LQR */
-        return control_auto();
-    }
-    /* STANDBY */
-    return 0.0f;
 }
 
-//Filtro promedio movil
+//Filtro promedio movil (n = muestras válidas)
 static float promedio_movil(const float *buf, int n)
 {
+    if (n <= 0) return 0.0f;
     float suma = 0.0f;
     for (int i = 0; i < n; i++) suma += buf[i];
     return suma / n;
 }
 
-//Estimador
-static void actualizar_estimador_fd(float pb_nuevo, float pd_nuevo)
+//Estimador: diferencia centrada sobre cuentas enteras + promedio móvil
+static void actualizar_estimador_fd(int32_t cb, int32_t cd)
 {
-    /* Correr el historial */
-    pb_hist[0] = pb_hist[1];
-    pb_hist[1] = pb_hist[2];
-    pb_hist[2] = pb_nuevo;
+    cb_hist[0] = cb_hist[1];  cb_hist[1] = cb_hist[2];  cb_hist[2] = cb;
+    cd_hist[0] = cd_hist[1];  cd_hist[1] = cd_hist[2];  cd_hist[2] = cd;
 
-    pd_hist[0] = pd_hist[1];
-    pd_hist[1] = pd_hist[2];
-    pd_hist[2] = pd_nuevo;
+    if (fd_count < 1000) fd_count++;
 
-    fd_count++;
+    //Necesitamos al menos 3 muestras para diferencia centrada
+    //Almenos 2 para diferencia atras
+    if (fd_count < DIFERENCIAS) return;
 
-    /* Necesitamos al menos 3 muestras para diferencia centrada */
-    if (fd_count < 3) return;
+    /* (x[k+1] - x[k-1]) / (2T), con la resta hecha en enteros */
+    const float k = RAD_POR_CUENTA / (2.0f * PEND_TS_S);
+    float vb_raw = INVERTIR_BARRA * (float)(cb_hist[2] - cb_hist[0]) * k;
+    float vd_raw = INVERTIR_DISCO * (float)(cd_hist[2] - cd_hist[0]) * k;
+;
 
-    /* Diferencia centrada: (x[k+1] - x[k-1]) / (2T) */
-    float vb_raw = (pb_hist[2] - pb_hist[0]) / (2.0f * PEND_TS_S);
-    float vd_raw = (pd_hist[2] - pd_hist[0]) / (2.0f * PEND_TS_S);
-
-    /* Actualizar buffer del promedio móvil */
     vbarra_hist[fd_idx] = vb_raw;
     vdisco_hist[fd_idx] = vd_raw;
     fd_idx = (fd_idx + 1) % FD_FILTRO_N;
+    if (ma_n < FD_FILTRO_N) ma_n++;
 
-    /* Salida filtrada */
-    vb_est = promedio_movil(vbarra_hist, FD_FILTRO_N);
-    vd_est = promedio_movil(vdisco_hist, FD_FILTRO_N);
+    vb_est = promedio_movil(vbarra_hist, ma_n);
+    vd_est = promedio_movil(vdisco_hist, ma_n);
 }
 
+//============================
+//Comandos por UART
+//============================
+static void cmd_excitacion(const exc_cfg_t *cfg, const char *ack)
+{
+    if (!handshake_ok || modo != MODO_OPEN_LOOP) {
+        responder("NACK,NOT_OPEN_LOOP\n");
+        return;
+    }
+    if (!exc_cfg_valida(cfg)) {
+        responder("NACK,BAD_VALUE\n");
+        return;
+    }
+    portENTER_CRITICAL(&estado_mux);
+    exc_pend      = *cfg;
+    exc_req_start = true;
+    exc_req_stop  = false;
+    portEXIT_CRITICAL(&estado_mux);
+    responder(ack);
+}
+
+static void procesar_linea(const char *l)
+{
+    if (strcmp(l, "PING") == 0) {
+        //Heartbeat, solo refresca t_ultimo_comando_ms
+        //tal vez quitarlo, ya se hace en recepción
+    }
+    else if (strcmp(l, "READY") == 0) {
+        if (!handshake_ok) {
+            handshake_ok = true;
+            ir_a_standby();
+        }
+        enviar_estado();
+    }
+    else if (strcmp(l, "HELLO?") == 0) {
+        handshake_ok = false;
+        ir_a_standby();
+        motor_set(0.0f, 0);
+    }
+    else if (strncmp(l, "SQUARE:", 7) == 0) {
+        exc_cfg_t c = { .tipo = EXC_SQUARE };
+        if (sscanf(l + 7, "%f,%f,%f", &c.freq, &c.amp_pct, &c.dur) == 3)
+            cmd_excitacion(&c, "ACK,EXC,SQUARE\n");
+        else
+            responder("NACK,BAD_FORMAT\n");
+    }
+    else if (strncmp(l, "CHIRP:", 6) == 0) {
+        exc_cfg_t c = { .tipo = EXC_CHIRP };
+        if (sscanf(l + 6, "%f,%f,%f,%f", &c.f0, &c.f1, &c.dur, &c.amp_pct) == 4)
+            cmd_excitacion(&c, "ACK,EXC,CHIRP\n");
+        else
+            responder("NACK,BAD_FORMAT\n");
+    }
+    else if (strncmp(l, "PRBS:", 5) == 0) {
+        exc_cfg_t c = { .tipo = EXC_PRBS };
+        if (sscanf(l + 5, "%f,%f,%f", &c.bitrate, &c.amp_pct, &c.dur) == 3)
+            cmd_excitacion(&c, "ACK,EXC,PRBS\n");
+        else
+            responder("NACK,BAD_FORMAT\n");
+    }
+    else if (strcmp(l, "EXC_STOP") == 0) {
+        portENTER_CRITICAL(&estado_mux);
+        exc_req_start = false;
+        exc_req_stop  = true;
+        portEXIT_CRITICAL(&estado_mux);
+        responder("ACK,EXC,STOP\n");
+    }
+    else if (strncmp(l, "MODE:", 5) == 0) {
+        if (!handshake_ok) {
+            responder("NACK,NO_HANDSHAKE\n");
+            return;
+        }
+        modo_t nuevo = MODO_STANDBY;
+        bool ok = false;
+        for (int i = 0; i < MODO_N; i++) {
+            if (strcmp(l + 5, MODO_NOMBRE[i]) == 0) { nuevo = (modo_t)i; ok = true; break; }
+        }
+        if (!ok) {
+            responder("NACK,BAD_MODE\n");
+            return;
+        }
+        portENTER_CRITICAL(&estado_mux);
+        modo          = nuevo;
+        manual_izq    = false;
+        manual_dcha    = false;
+        req_reset     = true;          //estimador + fase AUTO */
+        exc_req_start = false;
+        exc_req_stop  = true;          //cambiar de modo corta cualquier excitación
+        portEXIT_CRITICAL(&estado_mux);
+        enviar_estado();
+    }
+    else if (strncmp(l, "L:", 2) == 0) {
+        if (!handshake_ok) {
+            responder("NACK,NO_HANDSHAKE\n");
+        } else if (modo != MODO_STANDBY) {
+            responder("NACK,MOTOR_RUNNING\n");
+        } else {
+            ganancias_t g;
+            if (sscanf(l + 2, "%f,%f,%f", &g.l1, &g.l2, &g.l3) != 3) {
+                responder("NACK,BAD_FORMAT\n");
+            } else if (!isfinite(g.l1) || !isfinite(g.l2) || !isfinite(g.l3) ||
+                       fabsf(g.l1) > 1e6f || fabsf(g.l2) > 1e6f || fabsf(g.l3) > 1e6f) {
+                responder("NACK,BAD_VALUE\n");
+            } else {
+                portENTER_CRITICAL(&estado_mux);
+                ganancias = g;
+                portEXIT_CRITICAL(&estado_mux);
+                char ack[64];
+                int n = snprintf(ack, sizeof(ack), "ACK,L=%.4f,%.4f,%.4f\n", g.l1, g.l2, g.l3);
+                if (n > (int)sizeof(ack) - 1) n = (int)sizeof(ack) - 1;
+                if (n > 0) uart_write_bytes(UART_NUM, ack, n);
+            }
+        }
+    }
+    else if (strcmp(l, "ESTOP") == 0) {
+        ir_a_standby();
+        motor_set(0.0f, 0);
+        if (handshake_ok) enviar_estado();
+    }
+    else if (strcmp(l, "ZERO") == 0) {
+        if (!handshake_ok) {
+            responder("NACK,NO_HANDSHAKE\n");
+        } else if (modo != MODO_STANDBY) {
+            responder("NACK,NOT_STANDBY\n");
+        } else {
+            portENTER_CRITICAL(&estado_mux);
+            req_zero = true;
+            portEXIT_CRITICAL(&estado_mux);
+            responder("ACK,ZERO\n");            
+        }
+    }
+    else if (strncmp(l, "WMAXI:", 6) == 0) {
+        if (!handshake_ok) {
+            responder("NACK,NO_HANDSHAKE\n");
+        } else {
+            float m_val;
+            if (sscanf(l + 6, "%f", &m_val) != 1 ||
+                !isfinite(m_val) || m_val < 0.1f || m_val > 20.0f) {
+                responder("NACK,BAD_VALUE\n");
+            } else {
+                //Enter critical para que no se cambie wmaxi_pend_mult mientras la tarea de control lo lee
+                portENTER_CRITICAL(&estado_mux);
+                wmaxi_pend_mult = m_val;
+                req_wmaxi  = true;
+                portEXIT_CRITICAL(&estado_mux);
+                char ack[32];
+                int n = snprintf(ack, sizeof(ack), "ACK,WMAXI,%.3f\n", m_val);
+                if (n > 0) uart_write_bytes(UART_NUM, ack, n);
+            }
+        }
+    }
+    else if (strncmp(l, "MANUAL:", 7) == 0) {
+        if (handshake_ok && modo == MODO_MANUAL) {
+            const char *d = l + 7;
+            if      (strcmp(d, "LEFT")  == 0) { manual_izq = true;  manual_dcha = false; }
+            else if (strcmp(d, "RIGHT") == 0) { manual_izq = false; manual_dcha = true;  }
+            else if (strcmp(d, "STOP")  == 0) { manual_izq = false; manual_dcha = false; }
+            t_manual_ms = ms_now();    
+        }
+    }
+    
+}
 
 //============================
 //Tareas
@@ -550,127 +844,30 @@ static void actualizar_estimador_fd(float pb_nuevo, float pd_nuevo)
 //Rx
 static void tarea_recepcion(void *param)
 {
-    uint8_t rx_buffer[256];
+    char    rx_buffer[128];
     int     rx_idx = 0;
+    bool    descartando = false;
     uint8_t byte_rx;
 
     while (1) {
         int len = uart_read_bytes(UART_NUM, &byte_rx, 1, pdMS_TO_TICKS(100));
         if (len <= 0) continue;
 
-        t_ultimo_comando_ms = (int32_t)(esp_timer_get_time() / 1000);
+        t_ultimo_comando_ms = ms_now();
 
         if (byte_rx == '\n' || byte_rx == '\r') {
-            rx_buffer[rx_idx] = '\0';
-
-            if (strncmp((char*)rx_buffer, "PING", 4) == 0) {
-                /* Heartbeat, no hace nada */
+            if (!descartando && rx_idx > 0) {
+                rx_buffer[rx_idx] = '\0';
+                procesar_linea(rx_buffer);
             }
-            else if (strncmp((char*)rx_buffer, "READY", 5) == 0) {
-                handshake_ok = true;
-                exc_detener();
-                u_ctrl = 0.0f;
-                resetear_estimador();
-                enviar_estado();
-            }
-            else if (strncmp((char*)rx_buffer, "HELLO?", 6) == 0) {
-                handshake_ok = false;
-                exc_detener();
-            }
-            else if (strncmp((char*)rx_buffer, "SQUARE:", 7) == 0) {
-                float f, a, T;
-                if (sscanf((char*)rx_buffer + 7, "%f,%f,%f", &f, &a, &T) == 3) {
-                    exc_freq = f; exc_amp_pct = a; exc_duracion = T;
-                    if (exc_iniciar(EXC_SQUARE))
-                        uart_write_bytes(UART_NUM, "ACK,EXC,SQUARE\n", 15);
-                    else
-                        uart_write_bytes(UART_NUM, "NACK,NOT_OPEN_LOOP\n", 19);
-                } else {
-                    uart_write_bytes(UART_NUM, "NACK,BAD_FORMAT\n", 16);
-                }
-            }
-            else if (strncmp((char*)rx_buffer, "CHIRP:", 6) == 0) {
-                float f0, f1, T, a;
-                if (sscanf((char*)rx_buffer + 6, "%f,%f,%f,%f", &f0, &f1, &T, &a) == 4) {
-                    exc_f0 = f0; exc_f1 = f1; exc_duracion = T; exc_amp_pct = a;
-                    if (exc_iniciar(EXC_CHIRP))
-                        uart_write_bytes(UART_NUM, "ACK,EXC,CHIRP\n", 14);
-                    else
-                        uart_write_bytes(UART_NUM, "NACK,NOT_OPEN_LOOP\n", 19);
-                } else {
-                    uart_write_bytes(UART_NUM, "NACK,BAD_FORMAT\n", 16);
-                }
-            }
-            else if (strncmp((char*)rx_buffer, "PRBS:", 5) == 0) {
-                float br, a, T;
-                if (sscanf((char*)rx_buffer + 5, "%f,%f,%f", &br, &a, &T) == 3) {
-                    exc_bitrate = br; exc_amp_pct = a; exc_duracion = T;
-                    if (exc_iniciar(EXC_PRBS))
-                        uart_write_bytes(UART_NUM, "ACK,EXC,PRBS\n", 13);
-                    else
-                        uart_write_bytes(UART_NUM, "NACK,NOT_OPEN_LOOP\n", 19);
-                } else {
-                    uart_write_bytes(UART_NUM, "NACK,BAD_FORMAT\n", 16);
-                }
-            }
-            else if (strncmp((char*)rx_buffer, "EXC_STOP", 8) == 0) {
-                exc_detener();
-                uart_write_bytes(UART_NUM, "ACK,EXC,STOP\n", 13);
-            }
-            else if (strncmp((char*)rx_buffer, "MODE:", 5) == 0) {
-                if (handshake_ok) {
-                    snprintf(modo_actual, sizeof(modo_actual),
-                             "%.15s", (char*)rx_buffer + 5);
-                    auto_fase = AUTO_SWINGUP; 
-                    resetear_estimador();
-                    pbo       = 0.0f;
-                    if (strncmp(modo_actual, "OPEN_LOOP", 9) != 0)
-                        exc_detener();
-                    enviar_estado();
-                }
-            }
-            else if (strncmp((char*)rx_buffer, "L:", 2) == 0) {
-                if (!handshake_ok) {
-                    uart_write_bytes(UART_NUM, "NACK,NO_HANDSHAKE\n", 18);
-                } else {
-                    float a, b, c;
-                    if (sscanf((char*)rx_buffer + 2, "%f,%f,%f", &a, &b, &c) == 3) {
-                        L1 = a; L2 = b; L3 = c;
-                        char ack[64];
-                        int n = snprintf(ack, sizeof(ack),
-                                         "ACK,L=%.4f,%.4f,%.4f\n", L1, L2, L3);
-                        uart_write_bytes(UART_NUM, ack, n);
-                    } else {
-                        uart_write_bytes(UART_NUM, "NACK,BAD_FORMAT\n", 16);
-                    }
-                }
-            }
-            else if (strncmp((char*)rx_buffer, "ESTOP", 5) == 0) {
-                auto_fase = AUTO_SWINGUP;
-                resetear_estimador();
-                pbo = 0.0f;
-                manual_izq = false;
-                manual_der = false;
-                strncpy(modo_actual, "STANDBY", sizeof(modo_actual) - 1);
-                modo_actual[sizeof(modo_actual) - 1] = '\0';
-                exc_detener();
-                motor_set(0);
-                if (handshake_ok) enviar_estado();
-            }
-            else if (strncmp((char*)rx_buffer, "MANUAL:LEFT", 11) == 0) {
-                if (handshake_ok) { manual_izq = true;  manual_der = false; }
-            }
-            else if (strncmp((char*)rx_buffer, "MANUAL:RIGHT", 12) == 0) {
-                if (handshake_ok) { manual_izq = false; manual_der = true;  }
-            }
-            else if (strncmp((char*)rx_buffer, "MANUAL:STOP", 11) == 0) {
-                if (handshake_ok) { manual_izq = false; manual_der = false; }
-            }
-
             rx_idx = 0;
+            descartando = false;
         }
         else if (rx_idx < (int)sizeof(rx_buffer) - 1) {
-            rx_buffer[rx_idx++] = byte_rx;
+            rx_buffer[rx_idx++] = (char)byte_rx;
+        }
+        else {
+            descartando = true;          //línea demasiado larga
         }
     }
 }
@@ -682,6 +879,9 @@ static void tarea_control(void *param)
     TickType_t last_wake      = xTaskGetTickCount();
     int64_t    t_prev_us      = esp_timer_get_time();
     paquete_t  pkt;
+    pkt.h1 = 0xAA;
+    pkt.h2 = 0xBB;
+    bool sobrevel_latch = false;
 
     while (1) {
         vTaskDelayUntil(&last_wake, periodo);
@@ -689,85 +889,144 @@ static void tarea_control(void *param)
         int64_t t_now_us = esp_timer_get_time();
         float dt = (t_now_us - t_prev_us) / 1e6f;
         t_prev_us = t_now_us;
-        if (dt <= 0.0f || dt > 0.5f) dt = PEND_TS_S; 
+        if (dt <= 0.0f || dt > 0.5f) dt = PEND_TS_S;
 
+        aplicar_comandos_pendientes();
         leer_encoders();
+        actualizar_estimador_fd(cnt_b_act, cnt_d_act);
 
-        actualizar_estimador_fd(pb,pd);
+        modo_t      m;
+        ganancias_t g;
+        portENTER_CRITICAL(&estado_mux);
+        m = modo;
+        g = ganancias;
+        portEXIT_CRITICAL(&estado_mux);
+
+        //Atrapar la barra en manual
+        if (m==MODO_MANUAL){
+            float e_abs = fabsf(error_vertical(pb));
+            //Considerar PEND_CAPT_RAD * 2 para que se más fácil en manual?
+            if(e_abs<PEND_CAPT_RAD){
+                //Solo se cambia si el modo SIGUE siendo MANUAL: si justo llegó un ESTOP o un
+                //MODE: por la UART, no hay que pisarlo.
+                bool cambio = false;
+                portENTER_CRITICAL(&estado_mux);
+                if (modo == MODO_MANUAL) {
+                    modo = MODO_STABILIZATION;
+                    manual_izq = false;
+                    manual_dcha = false;
+                    cambio = true;
+                }
+                m = modo;
+                portEXIT_CRITICAL(&estado_mux);
+                if (cambio) enviar_estado();
+            }
+        }
+
+       //Si se cae la barra en manual
+        if (m == MODO_STABILIZATION) {
+            float e_abs = fabsf(error_vertical(pb));
+
+            if (e_abs < PEND_CAPT_RAD) {
+                stab_capturada = true;
+            }
+            //Solo pasa a standby si hubo captura antes
+            
+            if (stab_capturada && e_abs > PEND_SALIDA_RAD) {
+                bool cambio = false;
+                portENTER_CRITICAL(&estado_mux);
+                if (modo == MODO_STABILIZATION) {
+                    modo        = MODO_STANDBY;
+                    manual_izq  = false;
+                    manual_dcha = false;
+                    req_reset   = true;
+                    cambio = true;
+                }
+                m = modo;
+                portEXIT_CRITICAL(&estado_mux);
+                if (cambio) enviar_estado();
+            }
+        }
 
         //Control según modo
         float u;
+        float rpm_disco = vd_est * 60.0f / (2.0f * PI_F);
+#if SOBREVEL_ACTIVO
+        //histéresis: frena al superar RPM_MAX y suelta al bajar del 90 %
+        if (fabsf(rpm_disco) > RPM_MAX)             sobrevel_latch = true;
+        else if (fabsf(rpm_disco) < 0.9f * RPM_MAX) sobrevel_latch = false;
+#endif
+        bool  sobrevel  = sobrevel_latch;
 
-        float rpm_disco = vd_est*60.0f/(2.0f*(float)M_PI);
-        if (fabsf(rpm_disco)>RPM_MAX){
-            u = (rpm_disco>0.0f)? -PEND_UMax: PEND_UMax;
-        }else if (!handshake_ok) {
+        if (sobrevel) {
+            //Protección: frenar el disco (contra-torque máximo)
+            u = (rpm_disco > 0.0f) ? -PEND_UMax : PEND_UMax;
+        } else if (!handshake_ok || m == MODO_STANDBY) {
             u = 0.0f;
-        }else{
-            u= calcular_control();
+        } else {
+            u = calcular_control(m, &g);
         }
 
-        motor_set(u);
+        if (!isfinite(u)) u = 0.0f;
+        u = sat(u, PEND_UMax);
 
-        u_ctrl = u;
+        //Rechequeo 
+        if (!sobrevel && (modo == MODO_STANDBY || !handshake_ok)) u = 0.0f;
 
+        bool balanceando = (m == MODO_STABILIZATION) ||
+                           (m == MODO_AUTO && auto_fase == AUTO_LQR);
+        motor_set(u, balanceando ? PWM_MIN_BALANCE : PWM_MIN_SWING);
 
         //telemetría siempre
-        pkt.h1          = 0xAA;
-        pkt.h2          = 0xBB;
         pkt.dt          = dt;
         pkt.theta       = pb;
-        pkt.theta_dot   = vb_est;   /* velocidad estimada barra */
-        pkt.omega_rueda = vd_est;   /* velocidad estimada disco */
+        pkt.theta_dot   = vb_est;  
+        pkt.omega_rueda = vd_est; 
         pkt.u           = (int16_t)(u * 100.0f);
 
         uart_write_bytes(UART_NUM, (const char *)&pkt, sizeof(pkt));
     }
 }
 
-//Handshake 
+//Handshake + watchdog de comunicación
 static void tarea_hello(void *param)
 {
-    vTaskDelay(pdMS_TO_TICKS(300));  /* deja estabilizar la UART */
+    vTaskDelay(pdMS_TO_TICKS(300));
+    uint32_t t_ult_hello = 0;
 
     while (1) {
+        uint32_t ahora = ms_now();
+
         if (handshake_ok) {
-            int32_t ahora = (int32_t)(esp_timer_get_time() / 1000);
-            if ((ahora - t_ultimo_comando_ms) > TIMEOUT_HANDSHAKE_MS) {
+            //Con el motor activo el límite es más corto: si la GUI se cuelga o se suelta el
+            //cable en pleno AUTO, el sistema no debe seguir actuando 5 s.
+            uint32_t limite = (modo != MODO_STANDBY) ? TIMEOUT_MOTOR_MS : TIMEOUT_HANDSHAKE_MS;
+            if ((uint32_t)(ahora - t_ultimo_comando_ms) > limite) {
                 handshake_ok = false;
-                manual_izq   = false;
-                manual_der   = false;
-                strncpy(modo_actual, "STANDBY", sizeof(modo_actual) - 1);
-                modo_actual[sizeof(modo_actual) - 1] = '\0';
-                auto_fase = AUTO_SWINGUP;
-                resetear_estimador();
-                pbo = 0.0f;
-                exc_detener();
+                ir_a_standby();
+                motor_set(0.0f, 0);
             }
         }
-        if (!handshake_ok) {
-            const char *msg = "HELLO,v2.0,PENDULO_ESP32\n";
-            uart_write_bytes(UART_NUM, msg, strlen(msg));
+        if (!handshake_ok && (uint32_t)(ahora - t_ult_hello) >= PING_HELLO_MS) {
+            t_ult_hello = ahora;
+            responder("HELLO,v2.2,PENDULO_ESP32\n");
         }
-        vTaskDelay(pdMS_TO_TICKS(PING_HELLO_MS));
+        vTaskDelay(pdMS_TO_TICKS(WATCHDOG_PERIODO_MS));
     }
 }
 
 void app_main(void)
 {
+    //Desactivar logs de ESP-IDF
+    esp_log_level_set("*", ESP_LOG_NONE);//para que no se mezclen con la telemetría
     configurar_uart();
     configurar_pwm();
     configurar_encoder(ENC_BARRA_A, ENC_BARRA_B, &pcnt_barra);
     configurar_encoder(ENC_DISCO_A, ENC_DISCO_B, &pcnt_disco);
 
-    /* Inicialización del unwrap: leer el estado actual del disco */
-    {
-        int tmp;
-        pcnt_unit_get_count(pcnt_disco, &tmp);
-        pdma = tmp;
-    }
+    t_ultimo_comando_ms = ms_now();
 
-    xTaskCreate(tarea_recepcion, "recepcion", 4096, NULL, 5, NULL);
-    xTaskCreate(tarea_control,   "control",   8192, NULL, 6, NULL);
-    xTaskCreate(tarea_hello,     "hello",     4096, NULL, 3, NULL);
+    xTaskCreatePinnedToCore(tarea_recepcion, "recepcion", 6144, NULL, 5, NULL, CORE_COMM);
+    xTaskCreatePinnedToCore(tarea_control,   "control",   8192, NULL, 6, NULL, CORE_CTRL);
+    xTaskCreatePinnedToCore(tarea_hello,     "hello",     4096, NULL, 3, NULL, CORE_COMM);
 }

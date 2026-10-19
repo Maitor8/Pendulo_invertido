@@ -1,15 +1,3 @@
-/* Firmware ESP32 - Péndulo invertido con disco de inercia (v2.2, base: main_1.c)
- * Correcciones sobre main_1.c:
- *  1. _Static_assert del tick de FreeRTOS: con PEND_TS_MS=5 hace falta CONFIG_FREERTOS_HZ>=200
- *     (ESP-IDF trae 100 por defecto: pdMS_TO_TICKS(5)=0 y la tarea de control no cede la CPU).
- *  2. Freno por sobrevelocidad restaurado (estaba calculado y sin usar), con histéresis.
- *  3. Cambios de modo automáticos (MANUAL->STABILIZATION->STANDBY) hechos con comparar-y-asignar
- *     bajo spinlock: antes podían pisar un ESTOP/MODE llegado por la UART en ese instante.
- *  4. PWM_MIN_BALANCE ahora se usa; zona muerta distinta en balanceo y en swing-up/manual.
- *  5. Watchdog: con el motor activo, TIMEOUT_MOTOR_MS sin tráfico -> STANDBY (revisado cada 250 ms).
- *  6. Macros duplicadas e inconsistentes (PEND_*_DEG, DEG_POR_CUENTA) eliminadas.
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

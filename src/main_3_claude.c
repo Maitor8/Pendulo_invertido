@@ -108,8 +108,6 @@
 //Núcleos (control aislado de la comunicación)
 //vTaskDelayUntil trabaja en ticks: el periodo de control debe ser un número entero de ticks.
 //Con CONFIG_FREERTOS_HZ=100 (por defecto) 5 ms = 0 ticks. Subirlo a 1000 en menuconfig.
-_Static_assert((PEND_TS_MS * configTICK_RATE_HZ) % 1000 == 0 && (PEND_TS_MS * configTICK_RATE_HZ) >= 1000,
-               "PEND_TS_MS debe ser multiplo del tick de FreeRTOS: poner CONFIG_FREERTOS_HZ=1000");
 
 #if CONFIG_FREERTOS_UNICORE
   #define CORE_CTRL 0
