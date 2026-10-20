@@ -144,12 +144,14 @@ typedef struct {
     uint8_t h2;             //h2
     float   dt;             //periodo
     float   theta;          //pos barra rad
-    float   theta_dot;      //vel barra rad/s
-    float   omega_rueda;    //vel disco rad/s
+    float   theta_dot;      //vel barra rad/s, obs seleccionado
+    float   omega_rueda;    //vel disco rad/s, obs seleccionado
+    float theta_dot_other; //vel barra rad/s, obs no seleccionado
+    float omega_other;      //vel disco rad/s, obs no seleccionado
     int16_t u;              //u*100 (u en unidades de control, ±PEND_UMax; no en volt)
 } paquete_t;
 #pragma pack(pop)
-_Static_assert(sizeof(paquete_t) == 20, "paquete_t debe medir 20 bytes (la GUI lee 2 + 18)");
+_Static_assert(sizeof(paquete_t) == 28, "paquete_t debe medir 28 bytes (la GUI lee 2 + 26)");
 
 //Balanceo
 typedef enum {
@@ -416,7 +418,7 @@ static void enviar_estado(void)
 
     char buf[256];
     int n = snprintf(buf, sizeof(buf),
-                     "STATE,L=%.4f,%.4f,%.4f;MODE=%s;WMAXI=%.3f;EST=%s;OBS=%.3f,%.3f,%.3f,%.3f\n",
+                     "STATE,L=%.4f,%.4f,%.4f;MODE=%s;WMAXI=%.3f;EST=%s;OBS=%.3f,%.3f,%.3f,%.3f;PROTO=2\n",
                      g.l1, g.l2, g.l3, MODO_NOMBRE[m], wm, EST_NOMBRE[em],
                      og.lb1, og.lb2, og.ld1, og.ld2);
     if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
@@ -1096,12 +1098,12 @@ static void tarea_control(void *param)
         //Control según modo
         float u;
         float rpm_disco = vd_est * 60.0f / (2.0f * PI_F);
-#if SOBREVEL_ACTIVO
-        //histéresis: frena al superar RPM_MAX y suelta al bajar del 90 %
-        if (fabsf(rpm_disco) > RPM_MAX)             sobrevel_latch = true;
-        else if (fabsf(rpm_disco) < 0.9f * RPM_MAX) sobrevel_latch = false;
-#endif
-        bool  sobrevel  = sobrevel_latch;
+    #if SOBREVEL_ACTIVO
+            //histéresis: frena al superar RPM_MAX y suelta al bajar del 90 %
+            if (fabsf(rpm_disco) > RPM_MAX)             sobrevel_latch = true;
+            else if (fabsf(rpm_disco) < 0.9f * RPM_MAX) sobrevel_latch = false;
+    #endif
+            bool  sobrevel  = sobrevel_latch;
 
         if (sobrevel) {
             //Protección: frenar el disco (contra-torque máximo)
@@ -1128,6 +1130,14 @@ static void tarea_control(void *param)
         pkt.theta_dot   = vb_est;  
         pkt.omega_rueda = vd_est; 
         pkt.u           = (int16_t)(u * 100.0f);
+
+        if (em==EST_OBS){
+            pkt.theta_dot_other = vb_fd;
+            pkt.omega_other = vd_fd;
+        }else{
+            pkt.theta_dot_other = vb_obs;
+            pkt.omega_other = vd_obs;
+        }
 
         uart_write_bytes(UART_NUM, (const char *)&pkt, sizeof(pkt));
     }

@@ -275,7 +275,7 @@ class ScrollAwarePlotWidget(pg.PlotWidget):
 # =====================================================================
 class SerialManager(QtCore.QObject):
     #Signals
-    telemetria = QtCore.pyqtSignal(float, float, float, float,float)
+    telemetria = QtCore.pyqtSignal(float, float, float, float,float, float, float)  # t, theta, theta_dot, v_disco, u, vel_other, v_disco_other
     desconectado = QtCore.pyqtSignal(str)
     handshake_ok = QtCore.pyqtSignal(dict)
     handshake_perdido = QtCore.pyqtSignal()                
@@ -402,7 +402,7 @@ class SerialManager(QtCore.QObject):
 
     # ---- Hilo Receptor (binario + ASCII) ----
     _HDR = b'\xAA\xBB'
-    _PKT_LEN = 20            # 2 bytes de cabecera + 18 de carga (<ffffh)
+    _PKT_LEN = 28            # 2 bytes de cabecera + 26 de carga (<ffffh)
 
     def _leer_uart(self):
         """
@@ -444,13 +444,13 @@ class SerialManager(QtCore.QObject):
                     del buf[:i_hdr]           # basura antes de la cabecera
                 if len(buf) < self._PKT_LEN:
                     return                    # paquete incompleto: esperar más datos
-                dt, theta, theta_dot, omega, u_raw = struct.unpack(
-                    '<ffffh', bytes(buf[2:self._PKT_LEN]))
-                if self._paquete_plausible(dt, theta, theta_dot, omega):
+                dt, theta, theta_dot, omega, theta_dot_other, omega_other, u_raw = struct.unpack(
+                    '<ffffffh', bytes(buf[2:self._PKT_LEN]))
+                if self._paquete_plausible(dt, theta, theta_dot, omega, theta_dot_other, omega_other):
                     del buf[:self._PKT_LEN]
                     self.t_acumulado += dt
                     self.telemetria.emit(self.t_acumulado, theta, theta_dot,
-                                         omega, u_raw / 100.0)
+                                         omega, u_raw / 100.0, theta_dot_other, omega_other)
                 else:
                     del buf[:1]               # falso positivo: resincronizar
                 continue
@@ -461,10 +461,11 @@ class SerialManager(QtCore.QObject):
             return
 
     @staticmethod
-    def _paquete_plausible(dt, theta, theta_dot, omega):
+    def _paquete_plausible(dt, theta, theta_dot, omega, theta_dot_other, omega_other):
         return (0.0 < dt < 1.0
                 and all(math.isfinite(v) and abs(v) < 1e5
-                        for v in (theta, theta_dot, omega)))
+                        for v in (theta, theta_dot, omega, 
+                                  theta_dot_other, omega_other)))
 
     def _procesar_linea_ascii(self, linea: str):
         if linea.startswith("HELLO,"):
@@ -582,11 +583,13 @@ class SerialManager(QtCore.QObject):
 #  PANEL DE GRÁFICA  (pausa, auto-seguir X, autoescala Y)
 # =====================================================================
 class PlotPanel(QtWidgets.QWidget):
-    def __init__(self, titulo, ylabel, color, color_dark=None, parent=None):
+    def __init__(self, titulo, ylabel, color, color_dark=None, allow_overlay=False, parent=None):
         super().__init__(parent)
         self.paused = False
         self._color = color
         self._color_dark = color_dark if color_dark is not None else color
+        self._allow_overlay = allow_overlay
+        self._overlay_enabled = False
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -625,6 +628,13 @@ class PlotPanel(QtWidgets.QWidget):
         self.plot.setClipToView(True)
         self.curve = self.plot.plot(pen=pg.mkPen(color, width=2))
         self.curve.setSkipFiniteCheck(True)
+
+        self.curve_other= None
+        if allow_overlay:
+            self.curve_other = self.plot.plot(pen=pg.mkPen(color, width=1.5, style=QtCore.Qt.PenStyle.DashLine))
+            self.curve_other.setSkipFiniteCheck(True)
+            self.curve_other.setVisible(False)
+        
         layout.addWidget(self.plot)
 
         # Desactivamos el auto-range interno de pyqtgraph: nosotros gestionamos
@@ -653,14 +663,31 @@ class PlotPanel(QtWidgets.QWidget):
             title_item.setText(title_item.text, color=fg)
         self.curve.setPen(pg.mkPen(self._color_dark if dark else self._color, width=2))
 
+        if self.curve_other is not None:
+            self.curve_other.setPen(pg.mkPen(self._color_dark if dark else self._color,
+            width=1.5, style=QtCore.Qt.PenStyle.DashLine))
+
     def _on_pause(self, activo):
         self.paused = activo
 
-    def update_data(self, t_array, y_array):
+    def set_overlay(self, enabled: bool):
+        if self.curve_other is None:
+            return
+        self._overlay_enabled = enabled
+        self.curve_other.setVisible(enabled)
+        if not enabled:
+            self.curve_other.setData([], [])
+
+    def update_data(self, t_array, y_array, y_other=None):
         """Actualiza la curva. Si 'Auto escalado' está marcado, ajusta X e Y."""
         if self.paused:
             return
         self.curve.setData(t_array, y_array)
+
+        if self._overlay_enabled and self.curve_other is not None and y_other is not None:
+            self.curve_other.setData(t_array, y_other)
+        elif self.curve_other is not None:
+            self.curve_other.setData([], [])
 
         if not self.chk_auto.isChecked():
             return                       # el usuario manda: no tocar los rangos
@@ -679,6 +706,11 @@ class PlotPanel(QtWidgets.QWidget):
 
         ymin = float(np.min(y_array))
         ymax = float(np.max(y_array))
+        
+        if (self._overlay_enabled and y_other is not None and y_other.size > 0):
+            ymin = min(ymin, float(np.min(y_other)))
+            ymax = max(ymax, float(np.max(y_other)))
+        
         if ymax > ymin:
             pad = 0.05 * (ymax - ymin)   # 5 % de aire arriba y abajo
             vb.setYRange(ymin - pad, ymax + pad, padding=0.0)
@@ -955,6 +987,8 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self.vel_buf = deque(maxlen=n)
         self.disco_buf = deque(maxlen=n)
         self.u_buf= deque(maxlen=n)
+        self.vel_other_buf = deque(maxlen=n)
+        self.disco_other_buf = deque(maxlen=n)
 
         # ---------- Comunicación ----------
         self.serial = SerialManager(self)
@@ -1038,9 +1072,9 @@ class InterfazPendulo(QtWidgets.QMainWindow):
 
         # Crear los 4 paneles
         self.panel_pos_barra = PlotPanel("Posición de la Barra (rad)", "θ (rad)", 'b', color_dark='#4fc3f7')  # azul
-        self.panel_vel_barra = PlotPanel("Velocidad de la Barra (rad/s)", "ω (rad/s)", 'r', color_dark='#ff5252')  # rojo
+        self.panel_vel_barra = PlotPanel("Velocidad de la Barra (rad/s)", "ω (rad/s)", 'r', color_dark='#ff5252', allow_overlay=True)  # rojo
         self.panel_vel_disco = PlotPanel("Velocidad del Disco / Puente H (rad/s)",
-                                        "ω disco (rad/s)", 'g', color_dark='#69f0ae')  # verde
+                                        "ω disco (rad/s)", 'g', color_dark='#69f0ae', allow_overlay=True)  # verde
         self.panel_u         = PlotPanel("Señal de control · u", "u (unid. de control)", (255, 140, 0), color_dark='#ffb74d')  # naranja
 
         # Diccionario para acceder por clave desde el selector
@@ -1074,9 +1108,9 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         layout_controles.setContentsMargins(0, 0, 6, 0)
         layout_controles.addWidget(self._crear_grupo_conexion())
         layout_controles.addWidget(self._crear_grupo_modos())
-        layout_controles.addWidget(self._crear_grupo_lazo_abierto())
         layout_controles.addWidget(self._crear_grupo_parametros())
         layout_controles.addWidget(self._crear_grupo_observador())
+        layout_controles.addWidget(self._crear_grupo_lazo_abierto())
         layout_controles.addWidget(self._crear_grupo_grabacion())
         layout_controles.addStretch()
         scroll.setWidget(contenido)
@@ -1136,8 +1170,18 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         g = QtWidgets.QGroupBox("Gráficas visibles")
         h = QtWidgets.QHBoxLayout(g)
         h.setContentsMargins(6, 4, 6, 4)
-        h.setSpacing(10)
+        h.setSpacing(12)
 
+        self.chk_overlay = QtWidgets.QCheckBox("Superponer observadores")
+        self.chk_overlay.setToolTip(
+            "Si está marcado, las gráficas de ω barra y ω disco muestran\n"
+            "también la estimación del otro observador (trazo discontinuo)."
+        )
+        
+        self.chk_overlay.setChecked(False)
+        self.chk_overlay.toggled.connect(self._on_overlay_toggled)
+        h.addWidget(self.chk_overlay)
+        
         self.chk_graf = {}
         for clave, etiqueta in [
             ("pos",   "θ barra"),
@@ -1156,6 +1200,11 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         h.addStretch()
         return g
 
+    def _on_overlay_toggled(self, activo: bool):
+        self.panel_vel_barra.set_overlay(activo)
+        self.panel_vel_disco.set_overlay(activo)
+        self._plot_tick()   # redibujar inmediatamente
+    
     def _on_grafica_toggled(self, clave, visible):
         """Muestra u oculta una gráfica. El layout recoloca el resto automáticamente."""
         panel = self._paneles_graficas[clave]
@@ -1549,9 +1598,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
             self.lbl_gains_lock.setText("⚠ Sin conexión: handshake no establecido.")
         else:
             self.lbl_gains_lock.setText(
-                "⚠ Bloqueado: el motor está en movimiento. "
-                "Detenga el sistema (En Espera) para enviar nuevas ganancias."
-            )
+                "⚠ Envío de ganancias bloqueado. ")
 
     def _set_motor_moving(self, moving: bool):
         if self.motor_moving != moving:
@@ -1854,9 +1901,13 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self.vel_buf.clear()
         self.disco_buf.clear()
         self.u_buf.clear()
+        self.vel_other_buf.clear()
+        self.disco_other_buf.clear()
         self.panel_fase.limpiar()
         for panel in self._paneles_graficas.values():     # incluye la gráfica de u
             panel.curve.setData([], [])
+            if panel.curve_other is not None:
+                panel.curve_other.setData([], [])
             vb = panel.plot.getViewBox()
             vb.setXRange(0, 1, padding=0.0)
             vb.setYRange(-1, 1, padding=0.0)
@@ -2188,7 +2239,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         try:
             with open(fname, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
-                w.writerow(["t_s", "theta_rad", "omega_rad_s", "v_disco_rad_s", "u_ctrl"])
+                w.writerow(["t_s", "theta_rad", "omega_rad_s", "v_disco_rad_s", "u_ctrl", "omega_other_rad_s", "v_disco_other_rad_s"])
                 w.writerows(self.recorded_data)
             QtWidgets.QMessageBox.information(
                 self, "Exportado",
@@ -2200,17 +2251,19 @@ class InterfazPendulo(QtWidgets.QMainWindow):
     # -----------------------------------------------------------------
     #  Telemetría y refresco
     # -----------------------------------------------------------------
-    @QtCore.pyqtSlot(float, float, float, float, float)
-    def _on_muestra(self, t, theta, omega, v_disco, u):
+    @QtCore.pyqtSlot(float, float, float, float, float, float, float)
+    def _on_muestra(self, t, theta, omega, v_disco, u, omega_other, v_disco_other):
         """Punto único de entrada de datos."""
         self.t_buf.append(t)
         self.pos_buf.append(theta)
         self.vel_buf.append(omega)
         self.disco_buf.append(v_disco)
         self.u_buf.append(u)
+        self.vel_other_buf.append(omega_other)
+        self.disco_other_buf.append(v_disco_other)
 
         if self.recording:
-            self.recorded_data.append((t, theta, omega, v_disco, u))
+            self.recorded_data.append((t, theta, omega, v_disco, u, omega_other, v_disco_other))
 
     def _plot_tick(self):
         """Refresco visual desacoplado de la adquisición para mantener la UI fluida."""
@@ -2221,21 +2274,25 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         # Asociación panel ↔ buffer
 
         paneles = [
-            (self.panel_pos_barra,  self.pos_buf),
-            (self.panel_vel_barra,  self.vel_buf),
-            (self.panel_vel_disco,  self.disco_buf),
-            (self.panel_u,          self.u_buf),
+            (self.panel_pos_barra,  self.pos_buf, None),
+            (self.panel_vel_barra,  self.vel_buf, self.vel_other_buf),
+            (self.panel_vel_disco,  self.disco_buf, self.disco_other_buf),
+            (self.panel_u,          self.u_buf, None),
         ]
 
         # Solo construimos el array de tiempo si hay al menos un panel activo
-        hay_activo = any(p.isVisible() and not p.paused for p, _ in paneles)
+        hay_activo = any(p.isVisible() and not p.paused for p, _ , _ in paneles)
         if hay_activo:
             tx = np.fromiter(self.t_buf, dtype=np.float64, count=len(self.t_buf))
-            for panel, buf in paneles:
+            overlay = self.chk_overlay.isChecked()
+            for panel, buf, buf_other in paneles:
                 if not panel.isVisible() or panel.paused:
                     continue
                 ty = np.fromiter(buf, dtype=np.float64, count=len(buf))
-                panel.update_data(tx, ty)
+                ty_other= None
+                if overlay and buf_other is not None:
+                    ty_other = np.fromiter(buf_other, dtype=np.float64, count=len(buf_other))
+                panel.update_data(tx, ty, ty_other)
 
         # Plano de fase de la barra (solo si su pestaña está visible)
         if self.panel_fase.isVisible():
@@ -2268,8 +2325,16 @@ def main():
     
     ventana = InterfazPendulo()
     ventana.show()
-    sys.exit(app.exec())
+    #Orde de destrucción
+    exit_code = app.exec()
+    try:
+        app.removeEventFilter(ventana)
+    except (RuntimeError, AttributeError):
+        pass
+    del ventana
+
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
