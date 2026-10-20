@@ -16,6 +16,12 @@ try:
 except ImportError:
     SERIAL_AVAILABLE = False
 
+import ctypes
+try:
+    from ctypes import wintypes
+except ImportError:
+    wintypes = None
+
 
 # =====================================================================
 #  CONFIGURACIÓN
@@ -194,9 +200,78 @@ class ToggleSwitch(QtWidgets.QAbstractButton):
         p.drawEllipse(QtCore.QPointF(self._offset, thumb_center_y), self._thumb_radius, self._thumb_radius)
         p.end()
 
+# =====================================================================
+#  Funcional, para que sea mas amigable
+# =====================================================================
+class FlexibleDoubleSpinBox(QtWidgets.QDoubleSpinBox):
+    """Acept ',' o '.' como separador decimal."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setLocale(QtCore.QLocale.c())  # Forzar punto como separador decimal
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):
+        """Evita que la rueda zoomee."""
+        event.ignore()
+
+    def keyPressEvent(self, event):
+        if event.text() == ',':
+            event = QtGui.QKeyEvent(event.type(),
+                    QtCore.Qt.Key.Key_Period, event.modifiers(), '.')
+        super().keyPressEvent(event)
+
+class NoWheelComboBox(QtWidgets.QComboBox):
+    """Evita que la rueda cambie la selección."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+class ScrollAwarePlotWidget(pg.PlotWidget):
+    """Fix para el scroll en las gráficas."""
+    def __init__(self, *args, auto_scale_getter=None, paused_getter=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._auto_scale_getter = auto_scale_getter or (lambda: False)
+        self._paused_getter     = paused_getter     or (lambda: False)
+
+    def wheelEvent(self, event):
+        # Zoom sólo si el usuario controla el viewport
+        can_zoom = (not self._auto_scale_getter()) or self._paused_getter()
+        if can_zoom:
+            super().wheelEvent(event)      # zoom nativo de pyqtgraph
+            return
+
+        # Auto-scale activo y no pausado → scrollear el panel
+        sa = self._find_ancestor_scroll_area()
+        if sa is None:
+            event.ignore()                 # no hay a dónde scrollear
+            return
+
+        bar = sa.verticalScrollBar()
+        pd  = event.pixelDelta()           # trackpads
+        ad  = event.angleDelta()           # rueda clásica (120 u = 1 notch)
+        if not pd.isNull():
+            bar.setValue(bar.value() - pd.y())
+            event.accept()
+        elif ad.y() != 0:
+            step = bar.singleStep() or 20
+            bar.setValue(bar.value() - int(ad.y() / 120.0 * step * 3))
+            event.accept()
+        else:
+            event.ignore()
+
+    def _find_ancestor_scroll_area(self):
+        w = self.parentWidget()
+        while w is not None:
+            if isinstance(w, QtWidgets.QScrollArea):
+                return w
+            w = w.parentWidget()
+        return None
 
 # =====================================================================
-#  CAPA DE COMUNICACIÓN UART  (a futuro: ESP32)
+#  CAPA DE COMUNICACIÓN UART 
 # =====================================================================
 class SerialManager(QtCore.QObject):
     #Signals
@@ -536,7 +611,11 @@ class PlotPanel(QtWidgets.QWidget):
         layout.addLayout(opciones)
 
         # Gráfica estilo osciloscopio (fondo blanco, trazo grueso)
-        self.plot = pg.PlotWidget(title=titulo)
+        self.plot = ScrollAwarePlotWidget(
+            title=titulo,
+            auto_scale_getter=lambda: self.chk_auto.isChecked(),
+            paused_getter=lambda: self.paused,
+        )
         self.plot.setLabel('left', ylabel)
         self.plot.setLabel('bottom', 'Tiempo (s)')
         for eje in ('left', 'bottom'):
@@ -644,7 +723,7 @@ class PhasePanel(QtWidgets.QWidget):
         fila = QtWidgets.QHBoxLayout()
         fila.setContentsMargins(4, 2, 4, 0)
         fila.addWidget(QtWidgets.QLabel("Posición:"))
-        self.cmb_x = QtWidgets.QComboBox()
+        self.cmb_x = NoWheelComboBox()
         self.cmb_x.addItems(["θ (rad) · 0 = colgando", "e (rad) · 0 = vertical arriba"])
         self.cmb_x.setToolTip(
             "θ: ángulo continuo del encoder (la vertical está en ±π).\n"
@@ -654,7 +733,7 @@ class PhasePanel(QtWidgets.QWidget):
         fila.addWidget(self.cmb_x)
         fila.addSpacing(12)
         fila.addWidget(QtWidgets.QLabel("Estela:"))
-        self.sp_ventana = QtWidgets.QDoubleSpinBox()
+        self.sp_ventana = FlexibleDoubleSpinBox()
         self.sp_ventana.setRange(0.5, float(HISTORIAL_S))
         self.sp_ventana.setValue(5.0)
         self.sp_ventana.setSingleStep(0.5)
@@ -676,7 +755,11 @@ class PhasePanel(QtWidgets.QWidget):
         layout.addLayout(fila)
 
         # ---- gráfica ----
-        self.plot = pg.PlotWidget(title="Plano de fase de la barra")
+        self.plot = ScrollAwarePlotWidget(
+            title="Plano de fase de la barra",
+            auto_scale_getter=lambda: self.chk_auto.isChecked(),
+            paused_getter=lambda: self.paused,
+        )
         self.plot.setLabel('left', 'ω barra (rad/s)')
         self.plot.setLabel('bottom', 'θ (rad)')
         for eje in ('left', 'bottom'):
@@ -1039,7 +1122,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
 
         h = QtWidgets.QHBoxLayout()
         h.addWidget(QtWidgets.QLabel("Puerto:"))
-        self.cmb_port = QtWidgets.QComboBox()
+        self.cmb_port = NoWheelComboBox()
         self.cmb_port.addItems(self._listar_puertos())
         h.addWidget(self.cmb_port, stretch=1)
         v.addLayout(h)
@@ -1144,7 +1227,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
 
         # --- Selector de tipo de señal ---
         v.addWidget(QtWidgets.QLabel("Tipo de excitación:"))
-        self.cmb_exc = QtWidgets.QComboBox()
+        self.cmb_exc = NoWheelComboBox()
         self.cmb_exc.addItems([
             "Onda cuadrada",
             "Chirp logarítmico",
@@ -1156,13 +1239,13 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         # --- Parámetros de onda cuadrada ---
         self.grp_square = QtWidgets.QGroupBox("Parámetros · Onda cuadrada")
         f_sq = QtWidgets.QFormLayout(self.grp_square)
-        self.sp_sq_freq = QtWidgets.QDoubleSpinBox()
+        self.sp_sq_freq = FlexibleDoubleSpinBox()
         self.sp_sq_freq.setRange(0.05, 20.0); self.sp_sq_freq.setValue(0.5)
         self.sp_sq_freq.setSuffix(" Hz")
-        self.sp_sq_amp = QtWidgets.QDoubleSpinBox()
+        self.sp_sq_amp = FlexibleDoubleSpinBox()
         self.sp_sq_amp.setRange(1, 100); self.sp_sq_amp.setValue(10)
         self.sp_sq_amp.setSuffix(" %")
-        self.sp_sq_T = QtWidgets.QDoubleSpinBox()
+        self.sp_sq_T = FlexibleDoubleSpinBox()
         self.sp_sq_T.setRange(1, 300); self.sp_sq_T.setValue(20)
         self.sp_sq_T.setSuffix(" s")
         f_sq.addRow("Frecuencia:", self.sp_sq_freq)
@@ -1173,16 +1256,16 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         # --- Parámetros de chirp ---
         self.grp_chirp = QtWidgets.QGroupBox("Parámetros · Chirp logarítmico")
         f_ch = QtWidgets.QFormLayout(self.grp_chirp)
-        self.sp_ch_f0 = QtWidgets.QDoubleSpinBox()
+        self.sp_ch_f0 = FlexibleDoubleSpinBox()
         self.sp_ch_f0.setRange(0.01, 10); self.sp_ch_f0.setValue(0.15)
         self.sp_ch_f0.setSuffix(" Hz")
-        self.sp_ch_f1 = QtWidgets.QDoubleSpinBox()
+        self.sp_ch_f1 = FlexibleDoubleSpinBox()
         self.sp_ch_f1.setRange(0.5, 25); self.sp_ch_f1.setValue(10.0)
         self.sp_ch_f1.setSuffix(" Hz")
-        self.sp_ch_T = QtWidgets.QDoubleSpinBox()
+        self.sp_ch_T = FlexibleDoubleSpinBox()
         self.sp_ch_T.setRange(5, 300); self.sp_ch_T.setValue(60)
         self.sp_ch_T.setSuffix(" s")
-        self.sp_ch_amp = QtWidgets.QDoubleSpinBox()
+        self.sp_ch_amp = FlexibleDoubleSpinBox()
         self.sp_ch_amp.setRange(1, 100); self.sp_ch_amp.setValue(5)
         self.sp_ch_amp.setSuffix(" %")
         f_ch.addRow("f inicial:", self.sp_ch_f0)
@@ -1194,15 +1277,15 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         # --- Parámetros de PRBS ---
         self.grp_prbs = QtWidgets.QGroupBox("Parámetros · PRBS")
         f_pr = QtWidgets.QFormLayout(self.grp_prbs)
-        self.sp_pr_br = QtWidgets.QDoubleSpinBox()
+        self.sp_pr_br = FlexibleDoubleSpinBox()
         self.sp_pr_br.setRange(0.1, 10.0); self.sp_pr_br.setValue(2.0)
         self.sp_pr_br.setSuffix(" Hz")
         self.sp_pr_br.setToolTip("Frecuencia de cambio de bit.\n"
                                 "Mantener ≤ 20 Hz para buena resolución a 200 Hz de muestreo.")
-        self.sp_pr_amp = QtWidgets.QDoubleSpinBox()
+        self.sp_pr_amp = FlexibleDoubleSpinBox()
         self.sp_pr_amp.setRange(1, 100); self.sp_pr_amp.setValue(5)
         self.sp_pr_amp.setSuffix(" %")
-        self.sp_pr_T = QtWidgets.QDoubleSpinBox()
+        self.sp_pr_T = FlexibleDoubleSpinBox()
         self.sp_pr_T.setRange(1, 300); self.sp_pr_T.setValue(30)
         self.sp_pr_T.setSuffix(" s")
         f_pr.addRow("Bitrate:",  self.sp_pr_br)
@@ -1222,6 +1305,12 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         v.addLayout(h)
 
         self._on_exc_type_changed(0)
+
+        for sp in (self.sp_sq_freq, self.sp_sq_amp, self.sp_sq_T,
+                self.sp_ch_f0, self.sp_ch_f1, self.sp_ch_T, self.sp_ch_amp,
+                self.sp_pr_br, self.sp_pr_amp, self.sp_pr_T):
+            sp.returnPressed.connect(self._on_exc_start)
+    
         return g
 
     def _on_exc_type_changed(self, idx):
@@ -1314,7 +1403,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         v.addWidget(self.lbl_gains_lock)
 
         v.addWidget(QtWidgets.QLabel("Multiplicador WMAXI:"))
-        self.sp_wmaxi = QtWidgets.QDoubleSpinBox()
+        self.sp_wmaxi = FlexibleDoubleSpinBox()
         self.sp_wmaxi.setRange(0.1, 20.0)
         self.sp_wmaxi.setValue(2.1)
         self.sp_wmaxi.setSingleStep(0.1)
@@ -1325,6 +1414,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
             "Se puede cambiar con el motor en marcha; se aplica en el próximo ciclo."
         )
         v.addWidget(self.sp_wmaxi)
+        self.sp_wmaxi.returnPressed.connect(self._on_send_wmaxi)
 
         self.btn_send_wmaxi = QtWidgets.QPushButton("Enviar WMAXI")
         self.btn_send_wmaxi.setStyleSheet(ESTILO_ENVIAR)
@@ -1340,7 +1430,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
 
         v.addWidget(QtWidgets.QLabel("Modo de estimación:"))
         h_est = QtWidgets.QHBoxLayout()
-        self.cmb_est = QtWidgets.QComboBox()
+        self.cmb_est = NoWheelComboBox()
         self.cmb_est.addItems(["DIF", "OBS"])
         self.cmb_est.setToolTip("DIF: diferencias finitas\nOBS: observador de Luenberger")
         h_est.addWidget(self.cmb_est, stretch=1)
@@ -1588,6 +1678,12 @@ class InterfazPendulo(QtWidgets.QMainWindow):
                 return True
         return super().eventFilter(obj, event)
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Reaplicar el tema del título tras el primer show: DWM a veces
+        # resetea el atributo al mostrar la ventana por primera vez.
+        self._aplicar_titulo_ventana_so(self.toggle_batman.isChecked())
+    
     def changeEvent(self, event):
         # Seguridad: si la ventana pierde el foco con una tecla sostenida, detener.
         if event.type() == QtCore.QEvent.Type.ActivationChange and not self.isActiveWindow():
@@ -1827,15 +1923,8 @@ class InterfazPendulo(QtWidgets.QMainWindow):
     def _on_zero(self):
         if not self.serial.handshake_completo or self.motor_moving:
             return
-        r = QtWidgets.QMessageBox.question(
-            self, "Reset",
-            "¿La barra está colgando hacia abajo y completamente quieta?\n\n"
-            "Esa posición pasa a ser θ = 0 y la vertical queda en θ = ±π.",
-            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-            QtWidgets.QMessageBox.StandardButton.No,
-        )
-        if r == QtWidgets.QMessageBox.StandardButton.Yes:
-            self.serial.enviar_zero()
+        
+        self.serial.enviar_zero()
 
     def _on_send_wmaxi(self):
         if not self.serial.handshake_completo:
@@ -1850,6 +1939,9 @@ class InterfazPendulo(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(bool, float, str)
     def _on_wmaxi_ack(self, ok: bool, val: float, motivo: str):
         if ok:
+            self.sp_wmaxi.blockSignals(True)
+            self.sp_wmaxi.setValue(val)
+            self.sp_wmaxi.blockSignals(False)
             self._mostrar_evento(f"WMAXI confirmado: {val:.3f}", ms=6000, color="#2e7d32")
         else:
             self._mostrar_evento(f"⚠ WMAXI rechazado: {motivo or 'BAD_VALUE'}",
@@ -1997,6 +2089,49 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self._on_mode_changed("STANDBY")
         self._set_motor_moving(False)
 
+    def _aplicar_titulo_ventana_so(self, dark: bool):
+            """Pinta la barra de título del SO en modo oscuro/claro.
+            Sólo Windows 10 1809+ / Windows 11. No-op en otras plataformas."""
+            if sys.platform != "win32" or wintypes is None:
+                return
+            try:
+                hwnd   = int(self.winId())
+                dwmapi = ctypes.windll.dwmapi
+                user32 = ctypes.windll.user32
+            except (AttributeError, OSError):
+                return
+    
+            valor = ctypes.c_int(1 if dark else 0)
+            aplicado = False
+            for attr in (20, 19):                  # 20 = W10 20H1+ / W11 ; 19 = W10 1809–1909
+                try:
+                    hr = dwmapi.DwmSetWindowAttribute(
+                        wintypes.HWND(hwnd),
+                        ctypes.c_uint(attr),
+                        ctypes.byref(valor),
+                        ctypes.sizeof(valor),
+                    )
+                    if hr == 0:                    # S_OK
+                        aplicado = True
+                        break
+                except OSError:
+                    continue
+    
+            if aplicado:
+                # Forzar repintado del marco no-cliente: sin esto a veces el color
+                # no se ve hasta que el usuario interactúa con la ventana.
+                SWP_NOMOVE       = 0x0002
+                SWP_NOSIZE       = 0x0001
+                SWP_NOZORDER     = 0x0004
+                SWP_FRAMECHANGED = 0x0020
+                try:
+                    user32.SetWindowPos(
+                        wintypes.HWND(hwnd), None, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED
+                    )
+                except OSError:
+                    pass
+    
     def _on_batman_toggled(self, activo: bool):
         """Cambia toda la paleta de colores (claro <-> Batman)."""
         # 1) Gráficas (fondo, ejes, títulos y color de traza)
@@ -2023,6 +2158,8 @@ class InterfazPendulo(QtWidgets.QMainWindow):
             background='#121212' if activo else 'w',
             foreground='#e0e0e0' if activo else 'k',
         )
+
+        self._aplicar_titulo_ventana_so(activo)
 
     def _on_toggle_record(self):
         if not self.recording:

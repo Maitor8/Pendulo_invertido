@@ -75,8 +75,8 @@
 #define PEND_CERO   (0.2f * sqrtf(PEND_Q1))//1.02 rad/s; si el swing no arranca, bajarlo
 
 //Motor
-#define PWM_MIN_SWING    100
-#define PWM_MIN_BALANCE  100
+#define PWM_MIN_SWING    50
+#define PWM_MIN_BALANCE  50
 #define RPM_MAX 3000
 
 //Inversiones, encoder y motor
@@ -382,9 +382,10 @@ static float motor_set(float u, int dmin)
     if (duty > 0 && duty < dmin) duty = dmin;
 
     int d0 = 0, d1 = 0;
-    if      (u >  0.5f) d0 = duty;
-    else if (u < -0.5f) d1 = duty;
+    if      (u >  0.2f) d0 = duty;
+    else if (u < -0.2f) d1 = duty;
 
+    //Semáforo para que no se pisen las tareas de control y RX (la de control es la que manda)
     xSemaphoreTake(motor_mtx, portMAX_DELAY);
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, d0);
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, d1);
