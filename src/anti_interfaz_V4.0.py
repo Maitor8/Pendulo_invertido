@@ -1,6 +1,7 @@
 import csv
 import math
 import sys
+import re
 import time
 import struct          # <-- NUEVO: Para decodificar binario
 import threading       # <-- NUEVO: Para leer sin congelar la GUI
@@ -35,6 +36,10 @@ HISTORIAL_S = 30              # segundos de histórico en pantalla
 timeout_handshake = 10000
 ping_interval_ms = 500     # el firmware pasa a STANDBY tras 1.5 s sin tráfico con el motor activo
 timeout_ack = 2000
+
+#Matriz K_d del observador 4x2
+OBS_KEYS = ("k11", "k12", "k21", "k22", "k31", "k32", "k41", "k42")
+OBS_DEFAULT = dict(zip(OBS_KEYS, (0.0437, 0.0000, 0.0978, 0.0001, 0.0000, 0.0338, 0.0000, 0.0181)))
 
 # Estilos Claro
 ESTILO_GLOBAL_CLARO = """
@@ -397,7 +402,7 @@ class SerialManager(QtCore.QObject):
         self._send(f"EST:{est}")
 
     def enviar_obs(self, obs: dict):
-        cmd = f"OBS:{float(obs['lb1']):.3f},{float(obs['lb2']):.3f},{float(obs['ld1']):.3f},{float(obs['ld2']):.3f}"
+        cmd = "OBS:" + ",".join(f"{float(obs[k]):.8g}" for k in OBS_KEYS)
         self._send(cmd)
 
     # ---- Hilo Receptor (binario + ASCII) ----
@@ -504,8 +509,8 @@ class SerialManager(QtCore.QObject):
                     elif item.startswith("OBS="):
                         try:
                             vals = [float(x) for x in item[4:].strip().split(',')]
-                            if len(vals) == 4:
-                                obs = {'lb1': vals[0], 'lb2': vals[1], 'ld1': vals[2], 'ld2': vals[3]}
+                            if len(vals) == len(OBS_KEYS):
+                                obs = dict(zip(OBS_KEYS, vals))
                         except ValueError:
                             obs = None
                 
@@ -551,7 +556,9 @@ class SerialManager(QtCore.QObject):
         elif linea.startswith("ACK,OBS="):
             try:
                 vals = [float(x) for x in linea[8:].strip().split(',')]
-                d = {'lb1': vals[0], 'lb2': vals[1], 'ld1': vals[2], 'ld2': vals[3]}
+                if len(vals)!=len(OBS_KEYS):
+                    raise ValueError(f"se esperaban {len(OBS_KEYS)} valores")
+                d = dict(zip(OBS_KEYS, vals))
                 self.obs_ack.emit(True, d, "")
                 print(f"[UART] ACK observador: {d}")
             except Exception as e:
@@ -958,7 +965,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self.recorded_data = []
         self.t = 0.0
         self.gains = {"L1": 0.0, "L2": 0.0, "L3": 0.0}
-        self.obs_gains = {"lb1": 80.0, "lb2": 1600.0, "ld1": 60.0, "ld2": 900.0}
+        self.obs_gains = dict(OBS_DEFAULT)
         # ACK de ganancias
         self._ack_pendiente = False
         self._ack_timer = QtCore.QTimer(self)
@@ -1490,30 +1497,38 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         h_est.addWidget(self.btn_apply_est)
         v.addLayout(h_est)
 
-        v.addWidget(QtWidgets.QLabel("Ganancias observador:"))
-        fila_obs = QtWidgets.QHBoxLayout()
-        fila_obs.setSpacing(8)
-        self.inputs_obs = {}
-        for key in ("lb1", "lb2", "ld1", "ld2"):
-            columna = QtWidgets.QVBoxLayout()
-            columna.setSpacing(2)
-
-            lbl = QtWidgets.QLabel(key)
+        v.addWidget(QtWidgets.QLabel("Matriz K_d del observador (4×2):"))
+        grid = QtWidgets.QGridLayout()
+        grid.setSpacing(4)
+        for col, txt in ((1, "innov. barra"), (2, "innov. disco")):
+            lbl = QtWidgets.QLabel(txt)
             lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
             lbl.setStyleSheet("font-size: 9pt;")
-
-            le = QtWidgets.QLineEdit(f"{self.obs_gains[key]:g}")
+            grid.addWidget(lbl, 0, col)
+        filas = ("pos barra", "vel barra", "pos disco", "vel disco")
+        self.inputs_obs = {}
+        for idx, key in enumerate(OBS_KEYS):
+            r, c = divmod(idx, 2)
+            if c == 0:
+                lbl = QtWidgets.QLabel(filas[r])
+                lbl.setStyleSheet("font-size: 9pt;")
+                grid.addWidget(lbl, r + 1, 0)
+            le = QtWidgets.QLineEdit(f"{self.obs_gains[key]:.6g}")
             le.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
-            le.setMinimumWidth(50)
-            le.setToolTip(f"Ganancia {key}")
+            le.setMinimumWidth(60)
+            le.setToolTip(f"{key.upper()}: corrige «{filas[r]}» con la innovación de "
+                            f"{'la barra' if c == 0 else 'el disco'}")
             le.returnPressed.connect(self._on_send_obs)
-
-            columna.addWidget(lbl)
-            columna.addWidget(le)
-            fila_obs.addLayout(columna)
+            grid.addWidget(le, r + 1, c + 1)
             self.inputs_obs[key] = le
+        v.addLayout(grid)
 
-        v.addLayout(fila_obs)
+        self.le_obs_paste = QtWidgets.QLineEdit()
+        self.le_obs_paste.setPlaceholderText("Pegar 8 valores por filas (K11,K12,K21,...) y Enter")
+        self.le_obs_paste.setToolTip("MATLAB:  fprintf('%.8g,', K_d.')   (K_d 4x2, orden de filas: "
+                                        "pos barra, vel barra, pos disco, vel disco)")
+        self.le_obs_paste.returnPressed.connect(self._on_obs_pegar)
+        v.addWidget(self.le_obs_paste)
 
         self.btn_send_obs = QtWidgets.QPushButton("Enviar al ESP32")
         self.btn_send_obs.setStyleSheet(ESTILO_ENVIAR)
@@ -1587,6 +1602,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self.btn_send_obs.setEnabled(puede)
         for le in self.inputs_obs.values():
             le.setEnabled(puede)
+        self.le_obs_paste.setEnabled(puede)
 
         puede_est = self.serial.handshake_completo
         self.cmb_est.setEnabled(puede_est)
@@ -1851,9 +1867,9 @@ class InterfazPendulo(QtWidgets.QMainWindow):
                 obs = info['OBS']
                 if isinstance(obs, dict):
                     self.obs_gains = obs
-                    for k in ("lb1", "lb2", "ld1", "ld2"):
+                    for k in OBS_KEYS:
                         if k in obs:
-                            self.inputs_obs[k].setText(f"{obs[k]:g}")
+                            self.inputs_obs[k].setText(f"{obs[k]:.6g}")
             self._sincronizado = True
 
         self._set_controles_conectados(True)
@@ -2009,19 +2025,36 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self.serial.enviar_est(modo_est)
 
     def _leer_obs_ui(self) -> dict:
-        """Lee los 4 campos lb1/lb2/ld1/ld2. Lanza ValueError con mensaje claro si alguno falla."""
+        """Lee los campos de K. Lanza ValueError con mensaje claro si alguno falla."""
         valores = {}
-        for key in ("lb1", "lb2", "ld1", "ld2"):
+        for key in OBS_KEYS:
             le = self.inputs_obs[key]
             texto = le.text().strip().replace(",", ".")
             try:
                 val = float(texto)
             except ValueError:
                 raise ValueError(f"{key}: '{le.text()}' no es un número válido.")
-            if not math.isfinite(val):
-                raise ValueError(f"{key}: el valor debe ser finito.")
+            if not math.isfinite(val) or abs(val)>1e4:
+                raise ValueError(f"{key.upper()}: el valor debe ser finito y |valor|<1e4.")
             valores[key] = val
         return valores
+
+    def _on_obs_pegar(self):
+        """Reparte 8 números separados por coma/espacio/; en la grilla (orden por filas)."""
+        partes = [p for p in re.split(r"[,;\s]+", self.le_obs_paste.text().strip()) if p]
+        try:
+            vals = [float(p) for p in partes]
+        except ValueError:
+            vals = []
+        if len(vals) != len(OBS_KEYS):
+            QtWidgets.QMessageBox.warning(
+                self, "Formato",
+                f"Se necesitan exactamente {len(OBS_KEYS)} números (K11,K12,K21,K22,K31,K32,K41,K42).")
+            return
+        for k, val in zip(OBS_KEYS, vals):
+            self.inputs_obs[k].setText(f"{val:.8g}")
+        self.le_obs_paste.clear()
+
 
     def _on_send_obs(self):
         if not self.serial.handshake_completo:
@@ -2061,22 +2094,17 @@ class InterfazPendulo(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(bool, dict, str)
     def _on_obs_ack(self, ok: bool, obs: dict, motivo: str):
         if ok:
-            if all(k in obs for k in ("lb1", "lb2", "ld1", "ld2")):
+            if all(k in obs for k in OBS_KEYS):
                 self.obs_gains = obs
-                for k in ("lb1", "lb2", "ld1", "ld2"):
-                    self.inputs_obs[k].setText(f"{obs[k]:g}")
-            self._mostrar_evento(
-                f"Observador confirmado: lb=({obs.get('lb1', 0.0):.3f}, {obs.get('lb2', 0.0):.3f}) "
-                f"ld=({obs.get('ld1', 0.0):.3f}, {obs.get('ld2', 0.0):.3f})",
-                ms=6000, color="#2e7d32"
-            )
+                for k in OBS_KEYS:
+                    self.inputs_obs[k].setText(f"{obs[k]:.6g}")
+            self._mostrar_evento("Observador K_d confirmado por el ESP32", ms=6000, color="#2e7d32")
         else:
-            for k in ("lb1", "lb2", "ld1", "ld2"):
-                self.inputs_obs[k].setText(f"{self.obs_gains[k]:g}")
+            for k in OBS_KEYS:
+                self.inputs_obs[k].setText(f"{self.obs_gains[k]:.6g}")
             self._mostrar_evento(
                 f"⚠ Observador rechazado por el ESP32: {motivo or 'OBS_UNSTABLE'}",
-                ms=8000, color="#b00"
-            )
+                ms=8000, color="#b00")
 
     @QtCore.pyqtSlot(bool, str, dict)
     def _on_ganancias_ack(self, ok: bool, motivo: str, gains: dict):

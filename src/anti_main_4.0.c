@@ -159,13 +159,14 @@ typedef enum {
     AUTO_LQR,
 } auto_fase_t;
 
+//ganancias del regulador
 typedef struct { float l1, l2, l3; } ganancias_t;
 
 //Estimador de velocidades
 typedef enum { EST_DIF = 0, EST_OBS = 1 } est_modo_t;
 static const char *const EST_NOMBRE[] = { "DIF", "OBS" };
-//Ganancias CONTINUAS del observador: barra (lb1: posición, lb2: velocidad) y disco (ld1, ld2).
-typedef struct { float lb1, lb2, ld1, ld2; } obs_gains_t;
+//Ganancias del observador
+typedef struct { float K[4][2]; } obs_gains_t;
 
 //============================
 //ESTADO GLOBAL
@@ -189,7 +190,10 @@ static volatile float wmaxi_pend_mult = 2.1f; //multiplicador de wmaxi, para el 
 
 //Estimador de velocidades (lo escribe RX solo en STANDBY; la tarea de control lee una copia)
 static volatile est_modo_t est_modo = EST_DIF;
-static obs_gains_t obs_g = { 80.0f, 1600.0f, 60.0f, 900.0f };  //wo barra = 40 rad/s, wo disco = 30 rad/s
+static obs_gains_t obs_g = {{0.0437,    0.0000},
+                            {0.0978,    0.0001},
+                            {0.0000,    0.0338},
+                            {0.0000,    0.0181} };  
 
 //Handshake
 static volatile bool     handshake_ok        = false;
@@ -400,6 +404,14 @@ static float motor_set(float u, int dmin)
     return (d1 > 0) ? -u_ef : ((d0 > 0) ? u_ef : 0.0f);
 }
 
+static int fmt_obs( char *dst, size_t n, const obs_gains_t *g)
+{
+    const float *p=&g->K[0][0];
+    return snprintf(dst, n, "%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g",
+                    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+}
+
+
 //send state
 static void enviar_estado(void)
 {
@@ -416,11 +428,12 @@ static void enviar_estado(void)
     og = obs_g;
     portEXIT_CRITICAL(&estado_mux);
 
-    char buf[256];
+    char obs_str[160];
+    fmt_obs(obs_str, sizeof(obs_str), &og);
+    char buf[384];
     int n = snprintf(buf, sizeof(buf),
-                     "STATE,L=%.4f,%.4f,%.4f;MODE=%s;WMAXI=%.3f;EST=%s;OBS=%.3f,%.3f,%.3f,%.3f;PROTO=2\n",
-                     g.l1, g.l2, g.l3, MODO_NOMBRE[m], wm, EST_NOMBRE[em],
-                     og.lb1, og.lb2, og.ld1, og.ld2);
+    "STATE,L=%.4f,%.4f,%.4f;MODE=%s;WMAXI=%.3f;EST=%s;OBS=%s;PROTO=3\n",
+                        g.l1, g.l2, g.l3, MODO_NOMBRE[m], wm, EST_NOMBRE[em], obs_str);
     if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
     if (n > 0) uart_write_bytes(UART_NUM, buf, n);
 }
@@ -705,17 +718,14 @@ static void actualizar_estimador_fd(int32_t cb, int32_t cd)
 //============================
 static bool obs_validar(const obs_gains_t *g)
 {
-    const float gv[4] = { g->lb1, g->lb2, g->ld1, g->ld2 };
-    for (int i = 0; i < 4; i++) {
-        if (!isfinite(gv[i]) || gv[i] <= 0.001f || gv[i] > 1e5f) return false;
+    const float *p = &g->K[0][0];
+    for (int i = 0; i < 8; i++) {
+        if (!isfinite(p[i]) || fabsf(p[i]) > 1e4f) return false;
     }
     return true;
 }
 
-//Observador de Luenberger discreto (predicción con el modelo + corrección con ambos encoders):
-//  barra:  th'' = -q1*sin(th) - q3*u + q2*w
-//  disco:  w'   = rho*(q3*u - q2*w) - th''        (w = velocidad del disco relativa a la barra)
-//Las ganancias son continuas: pos += lX1*Ts*r ;  vel += lX2*Ts*r   (r = innovación)
+
 static void actualizar_observador(const obs_gains_t *og)
 {
     const float Ts = PEND_TS_S;
@@ -749,10 +759,10 @@ static void actualizar_observador(const obs_gains_t *og)
     const float rd = dyd - dd_p;
 
     //Corrección:  x_hat = x_pred + K*r ;  delta = x_hat - y = -(1 - alfa)*r
-    obs_db = -(1.0f - og->lb1 * Ts) * rb;
-    obs_wb = wb_p + og->lb2 * Ts * rb;
-    obs_dd = -(1.0f - og->ld1 * Ts) * rd;
-    obs_wd = wd_p + og->ld2 * Ts * rd;
+    obs_db = -(1.0f - og->K[0][0]) * rb + og->K[0][1] * rd;
+    obs_wb = wb_p + og->K[1][0]*rb + og->K[1][1]*rd ;
+    obs_dd = og->K[2][0] * rb -(1.0f - og->K[2][1]) * rd; 
+    obs_wd = wd_p + og->K[3][0]*rb + og->K[3][1]*rd;
 
     obs_cb_prev = cnt_b_act;  obs_cd_prev = cnt_d_act;  obs_pb_prev = pb;
 
@@ -909,7 +919,10 @@ static void procesar_linea(const char *l)
             responder("NACK,MOTOR_RUNNING\n");
         } else {
             obs_gains_t g;
-            if (sscanf(l + 4, "%f,%f,%f,%f", &g.lb1, &g.lb2, &g.ld1, &g.ld2) != 4) {
+            float *p = &g.K[0][0];
+            if (sscanf(l + 4, "%f,%f,%f,%f,%f,%f,%f,%f",
+                    &p[0], &p[1], &p[2], &p[3],
+                    &p[4], &p[5], &p[6], &p[7]) != 8) {
                 responder("NACK,BAD_FORMAT\n");
             } else if (!obs_validar(&g)) {
                 responder("NACK,OBS_UNSTABLE\n");
@@ -918,9 +931,9 @@ static void procesar_linea(const char *l)
                 obs_g     = g;
                 req_reset = true;
                 portEXIT_CRITICAL(&estado_mux);
-                char ack[64];
-                int n = snprintf(ack, sizeof(ack), "ACK,OBS=%.3f,%.3f,%.3f,%.3f\n",
-                                 g.lb1, g.lb2, g.ld1, g.ld2);
+                char obs_str[160], ack[192];
+                fmt_obs(obs_str, sizeof(obs_str), &g);
+                int n = snprintf(ack, sizeof(ack), "ACK,OBS=%s\n", obs_str);
                 if (n > (int)sizeof(ack) - 1) n = (int)sizeof(ack) - 1;
                 if (n > 0) uart_write_bytes(UART_NUM, ack, n);
             }
@@ -981,7 +994,7 @@ static void procesar_linea(const char *l)
 //Rx
 static void tarea_recepcion(void *param)
 {
-    char    rx_buffer[128];
+    char    rx_buffer[256];
     int     rx_idx = 0;
     bool    descartando = false;
     uint8_t byte_rx;
