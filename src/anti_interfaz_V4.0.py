@@ -935,6 +935,313 @@ class PhasePanel(QtWidgets.QWidget):
 
 
 # =====================================================================
+#  PANEL DE ESQUEMA / ANIMACIÓN 2D DEL PÉNDULO CON DISCO
+# =====================================================================
+class PendulumCanvas(QtWidgets.QWidget):
+    """
+    Área de dibujo vectorial (QPainter) para el péndulo invertido de disco de inercia.
+    Coordenadas físicas:
+      - theta = 0 rad: barra colgando hacia abajo
+      - theta = ±pi rad: barra vertical invertida (arriba)
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(320, 320)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
+        self.theta = 0.0
+        self.phi_disco = 0.0
+        self.dark = True
+
+    def set_angles(self, theta: float, phi_disco: float):
+        self.theta = theta
+        self.phi_disco = phi_disco
+        self.update()
+
+    def set_theme(self, dark: bool):
+        self.dark = dark
+        self.update()
+
+    def paintEvent(self, event):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+
+        w = self.width()
+        h = self.height()
+        cx = w / 2.0
+        cy = h / 2.0
+
+        # Fondo del lienzo
+        bg_color = QtGui.QColor('#121212' if self.dark else '#ffffff')
+        p.fillRect(self.rect(), bg_color)
+
+        # Dimensiones escaladas relativas al tamaño del widget
+        base_dim = min(w, h)
+        L = base_dim * 0.36
+        r_pivot = max(6.0, base_dim * 0.022)
+        r_disco = max(18.0, base_dim * 0.05)
+        ancho_barra = max(5.0, base_dim * 0.022)
+
+        # Paleta de colores
+        if self.dark:
+            c_grid = QtGui.QColor(255, 255, 255, 25)
+            c_ref_text = QtGui.QColor(160, 160, 160)
+            c_base = QtGui.QColor(70, 70, 70)
+            c_barra = QtGui.QColor(100, 110, 120)
+            c_barra_borde = QtGui.QColor(60, 70, 80)
+            
+            c_disco_bg = QtGui.QColor(15, 25, 15)
+            c_neon = QtGui.QColor(30, 255, 90)
+            
+            c_pivot_fill = QtGui.QColor(40, 40, 40)
+            c_pivot_edge = QtGui.QColor(120, 120, 120)
+        else:
+            c_grid = QtGui.QColor(0, 0, 0, 25)
+            c_ref_text = QtGui.QColor(110, 110, 110)
+            c_base = QtGui.QColor(190, 190, 190)
+            c_barra = QtGui.QColor(140, 155, 170)
+            c_barra_borde = QtGui.QColor(70, 85, 100)
+            
+            c_disco_bg = QtGui.QColor(240, 255, 240)
+            c_neon = QtGui.QColor(33, 200, 80)
+            
+            c_pivot_fill = QtGui.QColor(245, 245, 245)
+            c_pivot_edge = QtGui.QColor(80, 80, 80)
+
+        # 1. Círculo y líneas de referencia
+        pen_ref = QtGui.QPen(c_grid, 1.2, QtCore.Qt.PenStyle.DashLine)
+        p.setPen(pen_ref)
+        p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+        p.drawEllipse(QtCore.QPointF(cx, cy), L, L)
+        p.drawLine(QtCore.QPointF(cx, cy - L - 15), QtCore.QPointF(cx, cy + L + 15))
+        p.drawLine(QtCore.QPointF(cx - L - 15, cy), QtCore.QPointF(cx + L + 15, cy))
+
+        font_ref = QtGui.QFont("sans-serif", 8)
+        p.setFont(font_ref)
+        p.setPen(QtGui.QPen(c_ref_text))
+        p.drawText(int(cx + 6), int(cy - L - 4), "θ = 180° (Invertido)")
+
+        # 2. Soporte/base fija del pivote
+        p.setPen(QtGui.QPen(c_base, 1.5))
+        p.setBrush(QtGui.QBrush(c_base))
+        base_h = r_pivot * 1.6
+        base_w = r_pivot * 2.8
+        soporte = QtGui.QPolygonF([
+            QtCore.QPointF(cx, cy),
+            QtCore.QPointF(cx - base_w / 2, cy + base_h),
+            QtCore.QPointF(cx + base_w / 2, cy + base_h),
+        ])
+        p.drawPolygon(soporte)
+
+        # 3. Cinemática de la barra
+        tip_x = cx + L * math.sin(self.theta)
+        tip_y = cy + L * math.cos(self.theta)
+
+        p.save()
+        p.translate(cx, cy)
+        p.rotate(-math.degrees(self.theta))
+
+        pen_barra = QtGui.QPen(c_barra_borde, 1.5)
+        p.setPen(pen_barra)
+        p.setBrush(QtGui.QBrush(c_barra))
+        rect_barra = QtCore.QRectF(-ancho_barra / 2.0, -r_pivot * 0.5, ancho_barra, L + r_pivot * 0.5)
+        p.drawRoundedRect(rect_barra, ancho_barra / 2.0, ancho_barra / 2.0)
+        p.restore()
+
+        # 4. Dibujo del Disco de inercia (Símbolo Unificado)
+        p.save()
+        p.translate(tip_x, tip_y)
+        p.rotate(-math.degrees(self.phi_disco))
+
+        # Fondo oscuro circular (tapa la barra del péndulo por detrás)
+        p.setPen(QtCore.Qt.PenStyle.NoPen)
+        p.setBrush(QtGui.QBrush(c_disco_bg))
+        p.drawEllipse(QtCore.QPointF(0, 0), r_disco, r_disco)
+
+        # Dimensiones proporcionales del logo
+        T = r_disco * 0.18
+        R_out = r_disco
+        R_in = R_out - T
+        r_out = r_disco * 0.42
+        r_in = r_out - T
+
+        # A) Anillo exterior
+        path_outer = QtGui.QPainterPath()
+        path_outer.addEllipse(QtCore.QPointF(0, 0), R_out, R_out)
+        path_hole_outer = QtGui.QPainterPath()
+        path_hole_outer.addEllipse(QtCore.QPointF(0, 0), R_in, R_in)
+        path_outer = path_outer.subtracted(path_hole_outer)
+
+        # B) Anillo interior
+        path_inner = QtGui.QPainterPath()
+        path_inner.addEllipse(QtCore.QPointF(0, 0), r_out, r_out)
+        path_hole_inner = QtGui.QPainterPath()
+        path_hole_inner.addEllipse(QtCore.QPointF(0, 0), r_in, r_in)
+        path_inner = path_inner.subtracted(path_hole_inner)
+
+        # C) Barras horizontales conectando los anillos
+        path_bars = QtGui.QPainterPath()
+        
+        # Superposición intencional (Overlap): hace que la barra invada el anillo 
+        # para que al unirlos no queden líneas vacías (aliasing)
+        overlap = r_disco * 0.05
+        
+        # Ancho de las barras: ya NO tocan el círculo exterior (R_in), 
+        # apenas sobrepasan el círculo interior (r_out) por una fracción de T
+        bar_hw = r_out + T * 0.75 
+        bar_w = bar_hw * 2
+
+        # Rectángulo superior (extendemos su altura hacia abajo para solapar)
+        path_bars.addRect(QtCore.QRectF(-bar_hw, -(r_out + T), bar_w, T + overlap))
+        
+        # Rectángulo inferior (subimos el inicio hacia arriba y mantenemos la altura extra)
+        path_bars.addRect(QtCore.QRectF(-bar_hw, r_out - overlap, bar_w, T + overlap))
+
+        # D) UNIFICACIÓN GEOMÉTRICA (Fusión perfecta)
+        logo_path = path_outer.united(path_inner).united(path_bars).simplified()
+
+        # E) Dibujar el resplandor difuminado (Halo)
+        glow_color = QtGui.QColor(c_neon)
+        glow_color.setAlpha(25)
+        p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+        
+        # Trazamos el borde con opacidades múltiples para un brillo suave
+        for thickness in [T * 1.8, T * 1.0, T * 0.4]:
+            pen_glow = QtGui.QPen(glow_color, thickness)
+            pen_glow.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
+            p.strokePath(logo_path, pen_glow)
+
+        # F) Dibujar el logo verde principal (Sólido)
+        p.setPen(QtCore.Qt.PenStyle.NoPen)
+        p.fillPath(logo_path, QtGui.QBrush(c_neon))
+
+        p.restore()
+
+        # 5. Pivote central fijo
+        p.setPen(QtGui.QPen(c_pivot_edge, 2.0))
+        p.setBrush(QtGui.QBrush(c_pivot_fill))
+        p.drawEllipse(QtCore.QPointF(cx, cy), r_pivot, r_pivot)
+        p.setBrush(QtGui.QBrush(c_barra_borde))
+        p.drawEllipse(QtCore.QPointF(cx, cy), r_pivot * 0.4, r_pivot * 0.4)
+
+        p.end()
+
+class SchematicPanel(QtWidgets.QWidget):
+    """
+    Panel contenedor de la pestaña de esquema animado en tiempo real.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.paused = False
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        # Fila superior
+        top_bar = QtWidgets.QHBoxLayout()
+        top_bar.setContentsMargins(4, 2, 4, 2)
+
+        self.lbl_titulo = QtWidgets.QLabel("Animación en tiempo real del péndulo")
+        self.lbl_titulo.setStyleSheet("font-weight: bold; font-size: 11pt;")
+        top_bar.addWidget(self.lbl_titulo)
+        top_bar.addStretch()
+
+        self.chk_pause = QtWidgets.QCheckBox("Pausar")
+        self.chk_pause.setStyleSheet("font-size: 9pt;")
+        self.chk_pause.toggled.connect(self._on_pause)
+        top_bar.addWidget(self.chk_pause)
+        layout.addLayout(top_bar)
+
+        # Canvas de dibujo 2D
+        self.canvas = PendulumCanvas(self)
+        layout.addWidget(self.canvas, stretch=1)
+
+        # Tarjetas de datos mínimos
+        info_frame = QtWidgets.QFrame()
+        info_frame.setObjectName("infoFrame")
+        info_layout = QtWidgets.QHBoxLayout(info_frame)
+        info_layout.setContentsMargins(12, 6, 12, 6)
+        info_layout.setSpacing(16)
+
+        self.lbl_deg = QtWidgets.QLabel("θ: 0.0°")
+        self.lbl_deg.setStyleSheet("font-family: monospace; font-size: 12pt; font-weight: bold;")
+        self.lbl_deg.setToolTip("Ángulo continuo de la barra en grados.")
+
+        self.lbl_rad = QtWidgets.QLabel("θ: 0.000 rad")
+        self.lbl_rad.setStyleSheet("font-family: monospace; font-size: 10pt;")
+
+        self.lbl_omega = QtWidgets.QLabel("ω: 0.000 rad/s")
+        self.lbl_omega.setStyleSheet("font-family: monospace; font-size: 10pt;")
+
+        self.lbl_vdisco = QtWidgets.QLabel("ω_disco: 0.0 rad/s")
+        self.lbl_vdisco.setStyleSheet("font-family: monospace; font-size: 10pt;")
+
+        self.lbl_estado = QtWidgets.QLabel("Estado: Colgando")
+        self.lbl_estado.setStyleSheet("font-size: 10pt; font-style: italic;")
+
+        info_layout.addWidget(self.lbl_deg)
+        info_layout.addWidget(self.lbl_rad)
+        info_layout.addWidget(self.lbl_omega)
+        info_layout.addWidget(self.lbl_vdisco)
+        info_layout.addStretch()
+        info_layout.addWidget(self.lbl_estado)
+
+        layout.addWidget(info_frame)
+
+    def _on_pause(self, activo):
+        self.paused = activo
+
+    def set_theme(self, dark: bool):
+        self.canvas.set_theme(dark)
+        color_texto = "#00A8ff" if dark else "#000000"
+        color_sub = "#e0e0e0" if dark else "#333333"
+        bg_frame = "#1a1a1a" if dark else "#f0f4f8"
+        border_frame = "#2d2d2d" if dark else "#dcdcdc"
+
+        self.lbl_deg.setStyleSheet(f"font-family: monospace; font-size: 12pt; font-weight: bold; color: {color_texto};")
+        for lbl in (self.lbl_rad, self.lbl_omega, self.lbl_vdisco, self.lbl_estado, self.lbl_titulo):
+            lbl.setStyleSheet(f"color: {color_sub}; font-size: 10pt;")
+        self.lbl_titulo.setStyleSheet(f"color: {color_sub}; font-weight: bold; font-size: 11pt;")
+
+        info_frame = self.findChild(QtWidgets.QFrame, "infoFrame")
+        if info_frame:
+            info_frame.setStyleSheet(
+                f"#infoFrame {{ background-color: {bg_frame}; border: 1px solid {border_frame}; border-radius: 6px; }}"
+            )
+
+    def update_telemetria(self, theta: float, omega: float, v_disco: float, dt: float, modo_sist: str):
+        """Actualiza el esquema con los valores instantáneos más recientes."""
+        if self.paused:
+            return
+
+        self.canvas.phi_disco = (self.canvas.phi_disco + v_disco * dt) % (2.0 * math.pi)
+        self.canvas.set_angles(theta, self.canvas.phi_disco)
+
+        deg = math.degrees(theta)
+        e_deg = math.degrees((theta % (2.0 * math.pi)) - math.pi)
+
+        self.lbl_deg.setText(f"θ: {deg:+7.1f}°")
+        self.lbl_rad.setText(f"θ: {theta:+7.3f} rad")
+        self.lbl_omega.setText(f"ω: {omega:+7.2f} rad/s")
+        self.lbl_vdisco.setText(f"ω_d: {v_disco:+7.1f} rad/s")
+
+        if abs(e_deg) < 10.0:
+            cabe_zona = "Vertical Invertida"
+        elif abs(deg % 360.0) < 15.0:
+            cabe_zona = "Colgan2"
+        else:
+            cabe_zona = "En movimiento"
+        self.lbl_estado.setText(f"Modo: {modo_sist} | Zona: {cabe_zona}")
+
+    def limpiar(self):
+        self.canvas.set_angles(0.0, 0.0)
+        self.lbl_deg.setText("θ: 0.0°")
+        self.lbl_rad.setText("θ: 0.000 rad")
+        self.lbl_omega.setText("ω: 0.000 rad/s")
+        self.lbl_vdisco.setText("ω_d: 0.0 rad/s")
+        self.lbl_estado.setText("Estado: Reposo")
+
+# =====================================================================
 #  VENTANA PRINCIPAL
 # =====================================================================
 class InterfazPendulo(QtWidgets.QMainWindow):
@@ -1135,6 +1442,8 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self.tabs_graficas.addTab(panel_graficas, "Señales")
         self.panel_fase = PhasePanel()
         self.tabs_graficas.addTab(self.panel_fase, "Plano de fase")
+        self.panel_esquema = SchematicPanel() 
+        self.tabs_graficas.addTab(self.panel_esquema, "Esquema Péndulo")  # ← NUEVO
         splitter.addWidget(self.tabs_graficas)
         splitter.addWidget(panel_derecho)
         splitter.setStretchFactor(0, 3)
@@ -1920,6 +2229,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self.vel_other_buf.clear()
         self.disco_other_buf.clear()
         self.panel_fase.limpiar()
+        self.panel_esquema.limpiar() 
         for panel in self._paneles_graficas.values():     # incluye la gráfica de u
             panel.curve.setData([], [])
             if panel.curve_other is not None:
@@ -2217,6 +2527,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         for panel in self._paneles_graficas.values():
             panel.set_theme(activo)
         self.panel_fase.set_theme(activo)
+        self.panel_esquema.set_theme(activo) 
 
         # 2) Hoja de estilos global del QMainWindow
         self.setStyleSheet(ESTILO_GLOBAL_BATMAN if activo else ESTILO_GLOBAL_CLARO)
@@ -2330,6 +2641,19 @@ class InterfazPendulo(QtWidgets.QMainWindow):
                 np.fromiter(self.pos_buf, dtype=np.float64, count=n),
                 np.fromiter(self.vel_buf, dtype=np.float64, count=n),
             )
+
+        #Esquema de la barra en tiempo real
+        if self.panel_esquema.isVisible() and len(self.t_buf) > 0:
+            theta_act = float(self.pos_buf[-1])
+            omega_act = float(self.vel_buf[-1])
+            disco_act = float(self.disco_buf[-1])
+            if len(self.t_buf) >= 2:
+                dt = float(self.t_buf[-1] - self.t_buf[-2])
+                if dt <= 0 or dt > 0.5:
+                    dt = 1.0 / FS_HZ
+            else:
+                dt = 1.0 / FS_HZ
+            self.panel_esquema.update_telemetria(theta_act, omega_act, disco_act, dt, self.mode)
 
         # Textos de UI a baja frecuencia
         self._status_div += 1
