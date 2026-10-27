@@ -37,9 +37,14 @@ timeout_handshake = 10000
 ping_interval_ms = 500     # el firmware pasa a STANDBY tras 1.5 s sin tráfico con el motor activo
 timeout_ack = 2000
 
-#Matriz K_d del observador 4x2
+#Matrices K_d de observadores (4x2)
+#NL
 OBS_KEYS = ("k11", "k12", "k21", "k22", "k31", "k32", "k41", "k42")
 OBS_DEFAULT = dict(zip(OBS_KEYS, (0.0437, 0.0000, 0.0978, 0.0001, 0.0000, 0.0338, 0.0000, 0.0181)))
+#KAL
+KAL_KEYS = ("ka11", "ka12", "ka21", "ka22", "ka31", "ka32", "ka41", "ka42")
+KAL_DEFAULT = dict(zip(KAL_KEYS, (0.0437, 0.0000, 0.0978, 0.0001, 0.0000, 0.0338, 0.0000, 0.0181)))
+
 
 # Estilos Claro
 ESTILO_GLOBAL_CLARO = """
@@ -289,6 +294,7 @@ class SerialManager(QtCore.QObject):
     wmaxi_ack = QtCore.pyqtSignal(bool, float, str)                 # WMAXI recibido del firmware
     est_ack = QtCore.pyqtSignal(bool, str)
     obs_ack = QtCore.pyqtSignal(bool, dict, str)
+    kal_ack = QtCore.pyqtSignal(bool, dict, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -405,6 +411,10 @@ class SerialManager(QtCore.QObject):
         cmd = "OBS:" + ",".join(f"{float(obs[k]):.8g}" for k in OBS_KEYS)
         self._send(cmd)
 
+    def enviar_kal(self, kal: dict):
+        cmd = "KAL:" + ",".join(f"{float(kal[k]):.8g}" for k in KAL_KEYS)
+        self._send(cmd)
+
     # ---- Hilo Receptor (binario + ASCII) ----
     _HDR = b'\xAA\xBB'
     _PKT_LEN = 28            # 2 bytes de cabecera + 26 de carga (<ffffh)
@@ -498,6 +508,7 @@ class SerialManager(QtCore.QObject):
                 wmaxi = None
                 est = None
                 obs = None
+                kal = None
                 for item in kv[2:]:
                     if item.startswith("WMAXI="):
                         try:
@@ -513,6 +524,12 @@ class SerialManager(QtCore.QObject):
                                 obs = dict(zip(OBS_KEYS, vals))
                         except ValueError:
                             obs = None
+                    elif item.startswith("KAL="):
+                        try:
+                            vals = [float(x) for x in item[4:].strip().split(',')]
+                            if len(vals) == len(KAL_KEYS): kal = dict(zip(KAL_KEYS, vals))
+
+                        except ValueError: kal = None
                 
                 self.handshake_completo = True
                 self.handshake_ok.emit({
@@ -522,6 +539,7 @@ class SerialManager(QtCore.QObject):
                     'wmaxi': wmaxi,
                     'EST': est,
                     'OBS': obs,
+                    'KAL': kal,
                 })
                 print(f"[UART] STATE: L=({l1}, {l2}, {l3}), modo={modo}")
             except Exception as e:
@@ -564,7 +582,15 @@ class SerialManager(QtCore.QObject):
             except Exception as e:
                 self.obs_ack.emit(False, {}, f"ACK OBS mal formado: {linea}")
                 print(f"[UART] ACK OBS mal formado '{linea}': {e}")
-
+        
+        elif linea.startswith("ACK,KAL="):
+            try:
+                vals = [float(x) for x in linea[8:].strip().split(',')]
+                self.kal_ack.emit(True, dict(zip(KAL_KEYS, vals)), "")
+            except Exception as e: self.kal_ack.emit(False, {}, f"Fallo el Karma: {linea}")
+        elif linea.startswith("NACK,KAL_UNSTABLE"):
+            self.kal_ack.emit(False, {}, "KAL_UNSTABLE")
+        
         elif linea.startswith("NACK,OBS_UNSTABLE"):
             print("[UART] NACK observador inestable")
             self.obs_ack.emit(False, {}, "OBS_UNSTABLE")
@@ -1273,6 +1299,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self.t = 0.0
         self.gains = {"L1": 0.0, "L2": 0.0, "L3": 0.0}
         self.obs_gains = dict(OBS_DEFAULT)
+        self.kal_gains = dict(KAL_DEFAULT)
         # ACK de ganancias
         self._ack_pendiente = False
         self._ack_timer = QtCore.QTimer(self)
@@ -1315,6 +1342,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self.serial.wmaxi_ack.connect(self._on_wmaxi_ack)
         self.serial.est_ack.connect(self._on_est_ack)
         self.serial.obs_ack.connect(self._on_obs_ack)
+        self.serial.kal_ack.connect(self._on_kal_ack)
 
         # ---------- UI ----------
         self._build_ui()
@@ -1789,24 +1817,11 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         return g
 
     # ---- Grupo: observador ----
-    def _crear_grupo_observador(self):
-        g = QtWidgets.QGroupBox("Observador")
-        v = QtWidgets.QVBoxLayout(g)
-
-        v.addWidget(QtWidgets.QLabel("Modo de estimación:"))
-        h_est = QtWidgets.QHBoxLayout()
-        self.cmb_est = NoWheelComboBox()
-        self.cmb_est.addItems(["DIF", "OBS"])
-        self.cmb_est.setToolTip("DIF: diferencias finitas\nOBS: observador de Luenberger")
-        h_est.addWidget(self.cmb_est, stretch=1)
-
-        self.btn_apply_est = QtWidgets.QPushButton("Aplicar estimador")
-        self.btn_apply_est.setStyleSheet(ESTILO_ENVIAR)
-        self.btn_apply_est.clicked.connect(self._on_apply_est)
-        h_est.addWidget(self.btn_apply_est)
-        v.addLayout(h_est)
-
-        v.addWidget(QtWidgets.QLabel("Matriz K_d del observador (4×2):"))
+    def _crear_editor_4x2(self, titulo, keys, valores, prefijo_tip, placeholder, tip_paste, on_send, on_paste):
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.addWidget(QtWidgets.QLabel(titulo))
         grid = QtWidgets.QGridLayout()
         grid.setSpacing(4)
         for col, txt in ((1, "innov. barra"), (2, "innov. disco")):
@@ -1815,36 +1830,77 @@ class InterfazPendulo(QtWidgets.QMainWindow):
             lbl.setStyleSheet("font-size: 9pt;")
             grid.addWidget(lbl, 0, col)
         filas = ("pos barra", "vel barra", "pos disco", "vel disco")
-        self.inputs_obs = {}
-        for idx, key in enumerate(OBS_KEYS):
+        inputs = {}
+        for idx, key in enumerate(keys):
             r, c = divmod(idx, 2)
             if c == 0:
                 lbl = QtWidgets.QLabel(filas[r])
                 lbl.setStyleSheet("font-size: 9pt;")
                 grid.addWidget(lbl, r + 1, 0)
-            le = QtWidgets.QLineEdit(f"{self.obs_gains[key]:.6g}")
+            le = QtWidgets.QLineEdit(f"{valores[key]:.6g}")
             le.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
             le.setMinimumWidth(60)
-            le.setToolTip(f"{key.upper()}: corrige «{filas[r]}» con la innovación de "
-                            f"{'la barra' if c == 0 else 'el disco'}")
-            le.returnPressed.connect(self._on_send_obs)
+            le.setToolTip(f"{prefijo_tip}{key.upper()}: corrige «{filas[r]}» con la innovación de {'la barra' if c == 0 else 'el disco'}")
+            le.returnPressed.connect(on_send)
             grid.addWidget(le, r + 1, c + 1)
-            self.inputs_obs[key] = le
+            inputs[key] = le
         v.addLayout(grid)
 
-        self.le_obs_paste = QtWidgets.QLineEdit()
-        self.le_obs_paste.setPlaceholderText("Pegar 8 valores por filas (K11,K12,K21,...) y Enter")
-        self.le_obs_paste.setToolTip("MATLAB:  fprintf('%.8g,', K_d.')   (K_d 4x2, orden de filas: "
-                                        "pos barra, vel barra, pos disco, vel disco)")
-        self.le_obs_paste.returnPressed.connect(self._on_obs_pegar)
-        v.addWidget(self.le_obs_paste)
+        paste = QtWidgets.QLineEdit()
+        paste.setPlaceholderText(placeholder)
+        paste.setToolTip(tip_paste)
+        paste.returnPressed.connect(on_paste)
+        v.addWidget(paste)
 
-        self.btn_send_obs = QtWidgets.QPushButton("Enviar al ESP32")
-        self.btn_send_obs.setStyleSheet(ESTILO_ENVIAR)
-        self.btn_send_obs.clicked.connect(self._on_send_obs)
-        v.addWidget(self.btn_send_obs)
+        btn = QtWidgets.QPushButton("Enviar al ESP32")
+        btn.setStyleSheet(ESTILO_ENVIAR)
+        btn.clicked.connect(on_send)
+        v.addWidget(btn)
+        return w, inputs, paste, btn
 
+    def _crear_grupo_observador(self):
+        g = QtWidgets.QGroupBox("Observador")
+        v = QtWidgets.QVBoxLayout(g)
+
+        v.addWidget(QtWidgets.QLabel("Modo de estimación:"))
+        h_est = QtWidgets.QHBoxLayout()
+        self.cmb_est = NoWheelComboBox()
+        self.cmb_est.addItems(["DIF", "OBS", "KAL"])
+        h_est.addWidget(self.cmb_est, stretch=1)
+        self.btn_apply_est = QtWidgets.QPushButton("Aplicar estimador")
+        self.btn_apply_est.setStyleSheet(ESTILO_ENVIAR)
+        self.btn_apply_est.clicked.connect(self._on_apply_est)
+        h_est.addWidget(self.btn_apply_est)
+        v.addLayout(h_est)
+
+        self.lbl_dif_info = QtWidgets.QLabel("DIF (diferencias finitas) no requiere ganancias.")
+        self.lbl_dif_info.setWordWrap(True)
+        self.lbl_dif_info.setStyleSheet("font-size: 9pt; font-style: italic;")
+        v.addWidget(self.lbl_dif_info)
+
+        self.w_obs, self.inputs_obs, self.le_obs_paste, self.btn_send_obs = self._crear_editor_4x2(
+            "Matriz K_d del observador (4x2):", OBS_KEYS, self.obs_gains, "",
+            "Pegar 8 valores por filas (K11,K12,K21,...) y Enter",
+            "MATLAB:  fprintf('%.8g,', K_d.')",
+            self._on_send_obs, self._on_obs_pegar)
+        v.addWidget(self.w_obs)
+
+        self.w_kal, self.inputs_kal, self.le_kal_paste, self.btn_send_kal = self._crear_editor_4x2(
+            "Matriz L_k del Kalman (4x2):", KAL_KEYS, self.kal_gains, "Kalman ",
+            "Pegar 8 valores por filas (L11,L12,L21,...) y Enter",
+            "MATLAB:  fprintf('%.8g,', L_k.')",
+            self._on_send_kal, self._on_kal_pegar)
+        v.addWidget(self.w_kal)
+
+        self.cmb_est.currentTextChanged.connect(self._actualizar_panel_ganancias_est)
+        self._actualizar_panel_ganancias_est()
         return g
+
+    def _actualizar_panel_ganancias_est(self, _txt=None):
+        sel = self.cmb_est.currentText()
+        self.lbl_dif_info.setVisible(sel == "DIF")
+        self.w_obs.setVisible(sel == "OBS")
+        self.w_kal.setVisible(sel == "KAL")
 
     def _crear_grupo_apariencia(self):
         g = QtWidgets.QGroupBox("Apariencia")
@@ -1912,6 +1968,11 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         for le in self.inputs_obs.values():
             le.setEnabled(puede)
         self.le_obs_paste.setEnabled(puede)
+
+        # Kalman
+        self.btn_send_kal.setEnabled(puede)
+        for le in self.inputs_kal.values(): le.setEnabled(puede)
+        self.le_kal_paste.setEnabled(puede)
 
         puede_est = self.serial.handshake_completo
         self.cmb_est.setEnabled(puede_est)
@@ -2179,6 +2240,12 @@ class InterfazPendulo(QtWidgets.QMainWindow):
                     for k in OBS_KEYS:
                         if k in obs:
                             self.inputs_obs[k].setText(f"{obs[k]:.6g}")
+            if info.get('KAL') is not None:
+                kal = info['KAL']
+                if isinstance(kal, dict):
+                    self.kal_gains = kal
+                    for k in KAL_KEYS:
+                        if k in kal: self.inputs_kal[k].setText(f"{kal[k]:.6g}")
             self._sincronizado = True
 
         self._set_controles_conectados(True)
@@ -2415,6 +2482,46 @@ class InterfazPendulo(QtWidgets.QMainWindow):
             self._mostrar_evento(
                 f"⚠ Observador rechazado por el ESP32: {motivo or 'OBS_UNSTABLE'}",
                 ms=8000, color="#b00")
+    
+    def _leer_kal_ui(self) -> dict:
+        valores = {}
+        for key in KAL_KEYS:
+            le = self.inputs_kal[key]
+            texto = le.text().strip().replace(",", ".")
+            try: val = float(texto)
+            except ValueError: raise ValueError(f"{key}: '{le.text()}' no es un número válido.")
+            if not math.isfinite(val) or abs(val) > 1e4: raise ValueError(f"{key.upper()}: debe ser finito y |valor|<1e4.")
+            valores[key] = val
+        return valores
+
+    def _on_kal_pegar(self):
+        partes = [p for p in re.split(r"[,;\s]+", self.le_kal_paste.text().strip()) if p]
+        try: vals = [float(p) for p in partes]
+        except ValueError: vals = []
+        if len(vals) != len(KAL_KEYS):
+            QtWidgets.QMessageBox.warning(self, "Formato", f"Se necesitan exactamente {len(KAL_KEYS)} números.")
+            return
+        for k, val in zip(KAL_KEYS, vals): self.inputs_kal[k].setText(f"{val:.8g}")
+        self.le_kal_paste.clear()
+
+    def _on_send_kal(self):
+        if not self.serial.handshake_completo or self.motor_moving: return
+        try: nuevas = self._leer_kal_ui()
+        except ValueError as e:
+            QtWidgets.QMessageBox.critical(self, "Error", f"Valor inválido.\n\n{e}")
+            return
+        self.serial.enviar_kal(nuevas)
+
+    @QtCore.pyqtSlot(bool, dict, str)
+    def _on_kal_ack(self, ok: bool, kal: dict, motivo: str):
+        if ok:
+            if all(k in kal for k in KAL_KEYS):
+                self.kal_gains = kal
+                for k in KAL_KEYS: self.inputs_kal[k].setText(f"{kal[k]:.6g}")
+            self._mostrar_evento("Kalman Ka confirmado", ms=6000, color="#2e7d32")
+        else:
+            for k in KAL_KEYS: self.inputs_kal[k].setText(f"{self.kal_gains[k]:.6g}")
+            self._mostrar_evento(f"⚠ Kalman rechazado: {motivo}", ms=8000, color="#b00")
 
     @QtCore.pyqtSlot(bool, str, dict)
     def _on_ganancias_ack(self, ok: bool, motivo: str, gains: dict):
@@ -2535,7 +2642,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         # 3) Botones "Enviar" (usan hoja propia, no la global)
         estilo_enviar = ESTILO_ENVIAR_BATMAN if activo else ESTILO_ENVIAR_CLARO
         for btn in (self.btn_exc_start, self.btn_send_gains,
-                    self.btn_send_wmaxi, self.btn_send_obs, self.btn_apply_est):
+                    self.btn_send_wmaxi, self.btn_send_obs, self.btn_send_kal, self.btn_apply_est):
             btn.setStyleSheet(estilo_enviar)
 
         # 4) Avisos rojo-oscuro: sobre fondo negro casi no se leen

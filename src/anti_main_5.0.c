@@ -163,10 +163,13 @@ typedef enum {
 typedef struct { float l1, l2, l3; } ganancias_t;
 
 //Estimador de velocidades
-typedef enum { EST_DIF = 0, EST_OBS = 1 } est_modo_t;
-static const char *const EST_NOMBRE[] = { "DIF", "OBS" };
-//Ganancias del observador
+typedef enum { EST_DIF = 0, EST_OBS = 1, EST_KAL = 2 } est_modo_t;
+static const char *const EST_NOMBRE[] = { "DIF", "OBS", "KAL" };
+//Ganancias del observador NL
 typedef struct { float K[4][2]; } obs_gains_t;
+//Ganancias del Kalman
+typedef struct { float Ka[4][2];} kal_gains_t;
+
 
 //============================
 //ESTADO GLOBAL
@@ -194,6 +197,26 @@ static obs_gains_t obs_g = {{0.0437,    0.0000},
                             {0.0978,    0.0001},
                             {0.0000,    0.0338},
                             {0.0000,    0.0181} };  
+                            
+static kal_gains_t kal_g = {{0.0437,    0.0000},
+                            {0.0978,    0.0001},
+                            {0.0000,    0.0338},
+                            {0.0000,    0.0181} };  
+
+static float phi_k[4][4]={ {1.0f   , 0.0050f,       0.0f,    0.0000f},
+        { 0.0f,    1.0000f,         0.0f,    0.0001f},
+         {0.0f,         0.0f,    1.0000f,    0.0049f},
+         {0.0f,         0.0f,         0.0f,    0.9773f}};
+static float gam_k[4][2]= {   {-0.0003f,   -0.0000f,},
+   {-0.1304f,   -0.0019f},
+    {0.0003f,    0.0011f},
+    {0.1289f,    0.4579f}};
+
+//Estado del Kalman
+static float kal_x[4]={0};
+static bool kal_init = false;
+static int32_t kal_cd_ref = 0;
+static float vb_kal = 0.0f, vd_kal = 0.0f;
 
 //Handshake
 static volatile bool     handshake_ok        = false;
@@ -411,6 +434,11 @@ static int fmt_obs( char *dst, size_t n, const obs_gains_t *g)
                     p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
 }
 
+static int fmt_kal(char *dst, size_t n, const kal_gains_t *g){
+    const float *p=&g->Ka[0][0];
+    return snprintf(dst, n, "%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g",
+                        p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+}
 
 //send state
 static void enviar_estado(void)
@@ -420,20 +448,26 @@ static void enviar_estado(void)
     float wm;
     est_modo_t em;
     obs_gains_t og;
+    kal_gains_t kg;
     portENTER_CRITICAL(&estado_mux);
     g = ganancias;
     m = modo;
     wm = wmaxi_pend_mult; //valor pendiente
     em = est_modo;
     og = obs_g;
+    kg= kal_g;
     portEXIT_CRITICAL(&estado_mux);
 
+    char kal_str[160];
+    fmt_kal(kal_str, sizeof(kal_str), &kg);
     char obs_str[160];
     fmt_obs(obs_str, sizeof(obs_str), &og);
-    char buf[384];
+
+    char buf[512];
     int n = snprintf(buf, sizeof(buf),
-    "STATE,L=%.4f,%.4f,%.4f;MODE=%s;WMAXI=%.3f;EST=%s;OBS=%s;PROTO=3\n",
-                        g.l1, g.l2, g.l3, MODO_NOMBRE[m], wm, EST_NOMBRE[em], obs_str);
+    "STATE,L=%.4f,%.4f,%.4f;MODE=%s;WMAXI=%.3f;EST=%s;OBS=%s;KAL=%s;PROTO=3\n",
+                        g.l1, g.l2, g.l3, MODO_NOMBRE[m], wm, 
+                        EST_NOMBRE[em], obs_str, kal_str);
     if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
     if (n > 0) uart_write_bytes(UART_NUM, buf, n);
 }
@@ -531,6 +565,8 @@ static void resetear_estimador(void)
     vb_fd = vd_fd = 0.0f;
     vb_obs = vd_obs = 0.0f;
     obs_init = false;          //el observador arranca de la próxima medición
+    kal_init = false;
+    vb_kal = vd_kal = 0.0f;
 }
 
 // Aplica los pedidos que dejó RX. Se llama al inicio de cada ciclo.
@@ -560,6 +596,7 @@ static void aplicar_comandos_pendientes(void)
         pcnt_unit_get_count(pcnt_barra, &cb);
         cnt_b_ref = cb;
         obs_init = false;      //pb saltó: el observador se reinicia
+        kal_init = false;
     }
     if(wm_req){
         wmaxi_mult = wm_val;
@@ -714,7 +751,7 @@ static void actualizar_estimador_fd(int32_t cb, int32_t cd)
 }
 
 //============================
-//Observador de velocidades
+//Observador NL
 //============================
 static bool obs_validar(const obs_gains_t *g)
 {
@@ -774,6 +811,57 @@ static void actualizar_observador(const obs_gains_t *og)
     }
     vb_obs = obs_wb;
     vd_obs = obs_wd;
+}
+
+//============================
+//Observador Karmaland
+//============================
+static bool kal_validar(const kal_gains_t *g){
+    const float *p = &g ->Ka[0][0];
+    for (int i=0; i<8; i++){
+        if (!isfinite(p[i]) || fabsf(p[i]) > 1e4f) return false;
+    }
+    return true;
+}
+
+//Actualiza el observador Kalman
+static void karmaland(const kal_gains_t *kg){
+    const float phi_meas = INVERTIR_DISCO * (float)(cnt_d_act-kal_cd_ref)*RAD_POR_CUENTA;
+    if (!kal_init){
+        kal_cd_ref= cnt_d_act;
+        kal_x[0]= pb; kal_x[1]= 0.0f; kal_x[2]= 0.0f; kal_x[3]= 0.0f; 
+        vb_kal = vd_kal = 0.0f;
+        kal_init = true;
+        return;
+    }
+
+    //Salidas = estimación en k
+    vb_kal = kal_x[1];
+    vd_kal = kal_x[3];
+
+    //Predicción con la u aplicada
+    const float u0 = sinf(kal_x[0]);
+    const float u1 = u_aplicada;
+    float xp[4];
+    for (int i = 0; i < 4; i++){
+        float s = gam_k[i][0]*u0 + gam_k[i][1]*u1;
+        for (int j = 0; j < 4; j++) s += phi_k[i][j] * kal_x[j];
+        xp[i] = s;
+    }
+
+    //Corrección
+    const float eb = pb -xp[0];
+    const float ed = phi_meas -xp[2];
+    for (int i=0; i<4; i++) 
+        kal_x[i] = xp[i] + kg->Ka[i][0] * eb + kg->Ka[i][1]*ed;
+    
+    //Protección Detergente (divergencia)
+    for (int i = 0; i<4; i++)
+        if (!isfinite(kal_x[i]) || fabsf(kal_x[i])>1e4f ){
+            kal_init = false;
+            vb_kal = vd_kal = 0.0f;
+            break;
+        }
 }
 
 //============================
@@ -899,6 +987,7 @@ static void procesar_linea(const char *l)
             int sel = -1;
             if      (strcmp(l + 4, "DIF") == 0) sel = EST_DIF;
             else if (strcmp(l + 4, "OBS") == 0) sel = EST_OBS;
+            else if (strcmp(l + 4, "KAL")==0) sel = EST_KAL;
             if (sel < 0) {
                 responder("NACK,BAD_VALUE\n");
             } else {
@@ -934,6 +1023,33 @@ static void procesar_linea(const char *l)
                 char obs_str[160], ack[192];
                 fmt_obs(obs_str, sizeof(obs_str), &g);
                 int n = snprintf(ack, sizeof(ack), "ACK,OBS=%s\n", obs_str);
+                if (n > (int)sizeof(ack) - 1) n = (int)sizeof(ack) - 1;
+                if (n > 0) uart_write_bytes(UART_NUM, ack, n);
+            }
+        }
+    }
+    else if (strncmp(l, "KAL:", 4) == 0) {
+        if (!handshake_ok) {
+            responder("NACK,NO_HANDSHAKE\n");
+        } else if (modo != MODO_STANDBY) {
+            responder("NACK,MOTOR_RUNNING\n");
+        } else {
+            kal_gains_t g;
+            float *p = &g.Ka[0][0];
+            if (sscanf(l + 4, "%f,%f,%f,%f,%f,%f,%f,%f",
+                    &p[0], &p[1], &p[2], &p[3],
+                    &p[4], &p[5], &p[6], &p[7]) != 8) {
+                responder("NACK,BAD_FORMAT\n");
+            } else if (!kal_validar(&g)) {
+                responder("NACK,KAL_UNSTABLE\n");
+            } else {
+                portENTER_CRITICAL(&estado_mux);
+                kal_g     = g;
+                req_reset = true;
+                portEXIT_CRITICAL(&estado_mux);
+                char kal_str[160], ack[192];
+                fmt_kal(kal_str, sizeof(kal_str), &g);
+                int n = snprintf(ack, sizeof(ack), "ACK,KAL=%s\n", kal_str);
                 if (n > (int)sizeof(ack) - 1) n = (int)sizeof(ack) - 1;
                 if (n > 0) uart_write_bytes(UART_NUM, ack, n);
             }
@@ -1048,18 +1164,23 @@ static void tarea_control(void *param)
         ganancias_t g;
         est_modo_t  em;
         obs_gains_t og;
+        kal_gains_t kg;
         portENTER_CRITICAL(&estado_mux);
         m  = modo;
         g  = ganancias;
         em = est_modo;
         og = obs_g;
+        kg = kal_g;
         portEXIT_CRITICAL(&estado_mux);
 
         //Los dos estimadores corren siempre (cambiar desde la GUI no produce saltos);
         //el control y la telemetría usan el elegido.
         actualizar_estimador_fd(cnt_b_act, cnt_d_act);
         actualizar_observador(&og);
+        karmaland(&kg); //actualiza el observador Kalman
         if (em == EST_OBS) { vb_est = vb_obs; vd_est = vd_obs; }
+        else
+        if (em == EST_KAL) { vb_est = vb_kal; vd_est = vd_kal; }
         else               { vb_est = vb_fd;  vd_est = vd_fd;  }
 
         //Atrapar la barra en manual
