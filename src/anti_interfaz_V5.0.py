@@ -3,8 +3,8 @@ import math
 import sys
 import re
 import time
-import struct          # <-- NUEVO: Para decodificar binario
-import threading       # <-- NUEVO: Para leer sin congelar la GUI
+import struct         
+import threading       
 from collections import deque
 
 import numpy as np
@@ -28,6 +28,12 @@ except ImportError:
 #  CONFIGURACIÓN
 # =====================================================================
 FS_HZ = 200                   # telemetría del firmware: 1 / PEND_TS_MS (5 ms) = 200 Hz
+# Parámetros del pénd
+PEND_Q1  = 26.0736
+PEND_Q2  = 0.0189
+PEND_Q3  = 0.3819
+PEND_RHO = 241.5725
+PEND_UMAX = 12.0000
 MANUAL_KEEPALIVE_MS = 150     # refresco de la orden manual, deadman
 PLOT_HZ = 20                  # refresco visual: 20 Hz es fluido y deja libre el event loop
 PLOT_DT_MS = round(1000 / PLOT_HZ)
@@ -285,7 +291,7 @@ class ScrollAwarePlotWidget(pg.PlotWidget):
 # =====================================================================
 class SerialManager(QtCore.QObject):
     #Signals
-    telemetria = QtCore.pyqtSignal(float, float, float, float,float, float, float)  # t, theta, theta_dot, v_disco, u, vel_other, v_disco_other
+    telemetria = QtCore.pyqtSignal(float, float, float, float, float, float, float, float)  # t, theta, theta_dot, v_disco, u, vel_other, v_disco_other, phi_disco
     desconectado = QtCore.pyqtSignal(str)
     handshake_ok = QtCore.pyqtSignal(dict)
     handshake_perdido = QtCore.pyqtSignal()                
@@ -295,6 +301,7 @@ class SerialManager(QtCore.QObject):
     est_ack = QtCore.pyqtSignal(bool, str)
     obs_ack = QtCore.pyqtSignal(bool, dict, str)
     kal_ack = QtCore.pyqtSignal(bool, dict, str)
+    expr_ack = QtCore.pyqtSignal(bool, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -410,14 +417,18 @@ class SerialManager(QtCore.QObject):
     def enviar_obs(self, obs: dict):
         cmd = "OBS:" + ",".join(f"{float(obs[k]):.8g}" for k in OBS_KEYS)
         self._send(cmd)
+    
+    def enviar_expr(self, expr_str: str):
+        """Envia la ecuación personalizada"""
+        self._send(f"EXPR:{expr_str}")
 
     def enviar_kal(self, kal: dict):
         cmd = "KAL:" + ",".join(f"{float(kal[k]):.8g}" for k in KAL_KEYS)
         self._send(cmd)
 
-    # ---- Hilo Receptor (binario + ASCII) ----
+    # Hilo Receptor (binario + ASCII) 
     _HDR = b'\xAA\xBB'
-    _PKT_LEN = 28            # 2 bytes de cabecera + 26 de carga (<ffffh)
+    _PKT_LEN = 32            # 2 bytes de cabecera + 30 de carga (<ffffffh)
 
     def _leer_uart(self):
         """
@@ -459,13 +470,13 @@ class SerialManager(QtCore.QObject):
                     del buf[:i_hdr]           # basura antes de la cabecera
                 if len(buf) < self._PKT_LEN:
                     return                    # paquete incompleto: esperar más datos
-                dt, theta, theta_dot, omega, theta_dot_other, omega_other, u_raw = struct.unpack(
-                    '<ffffffh', bytes(buf[2:self._PKT_LEN]))
+                dt, theta, theta_dot, omega, theta_dot_other, omega_other, phi_disco, u_raw = struct.unpack(
+                    '<fffffffh', bytes(buf[2:self._PKT_LEN]))
                 if self._paquete_plausible(dt, theta, theta_dot, omega, theta_dot_other, omega_other):
                     del buf[:self._PKT_LEN]
                     self.t_acumulado += dt
                     self.telemetria.emit(self.t_acumulado, theta, theta_dot,
-                                         omega, u_raw / 100.0, theta_dot_other, omega_other)
+                                         omega, u_raw / 100.0, theta_dot_other, omega_other, phi_disco)
                 else:
                     del buf[:1]               # falso positivo: resincronizar
                 continue
@@ -483,6 +494,12 @@ class SerialManager(QtCore.QObject):
                                   theta_dot_other, omega_other)))
 
     def _procesar_linea_ascii(self, linea: str):
+
+        posiciones = [linea.find(p) for p in ("HELLO,", "STATE,", "ACK,", "NACK,")]
+        posiciones = [i for i in posiciones if i >=0]
+        if posiciones: linea = linea[min(posiciones):]
+        if not linea: return
+        
         if linea.startswith("HELLO,"):
             partes = linea.split(',')
             self.firmware_version = partes[1] if len(partes) > 1 else "?"
@@ -509,6 +526,7 @@ class SerialManager(QtCore.QObject):
                 est = None
                 obs = None
                 kal = None
+                expr_on = None
                 for item in kv[2:]:
                     if item.startswith("WMAXI="):
                         try:
@@ -530,6 +548,8 @@ class SerialManager(QtCore.QObject):
                             if len(vals) == len(KAL_KEYS): kal = dict(zip(KAL_KEYS, vals))
 
                         except ValueError: kal = None
+                    elif item.startswith("EXPR="):
+                        expr_on = (item[5:].strip() == "ON")
                 
                 self.handshake_completo = True
                 self.handshake_ok.emit({
@@ -540,6 +560,7 @@ class SerialManager(QtCore.QObject):
                     'EST': est,
                     'OBS': obs,
                     'KAL': kal,
+                    'EXPR': expr_on
                 })
                 print(f"[UART] STATE: L=({l1}, {l2}, {l3}), modo={modo}")
             except Exception as e:
@@ -590,6 +611,15 @@ class SerialManager(QtCore.QObject):
             except Exception as e: self.kal_ack.emit(False, {}, f"Fallo el Karma: {linea}")
         elif linea.startswith("NACK,KAL_UNSTABLE"):
             self.kal_ack.emit(False, {}, "KAL_UNSTABLE")
+
+        elif linea.startswith("ACK,EXPR_OK"):
+            self.expr_ack.emit(True,"")
+        elif linea.startswith("NACK,EXPR_BAD"):
+            try: pos = linea.split(":", 1)[1].strip()
+            except IndexError: pos = "?"
+            self.expr_ack.emit(False, pos)
+        elif linea.startswith("ACK,EXPR_RESET"):
+            self.expr_ack.emit(True, "RESET")
         
         elif linea.startswith("NACK,OBS_UNSTABLE"):
             print("[UART] NACK observador inestable")
@@ -607,6 +637,10 @@ class SerialManager(QtCore.QObject):
                 self.ganancias_ack.emit(False, f"ACK mal formado: {linea}", {})
                 print(f"[UART] ACK mal formado '{linea}': {e}")
 
+        elif linea.startswith("NACK,TOO_LONG"):
+            print("[UART] NACK: it's so big step bro")
+            self.expr_ack.emit(False, "TOO_LONG (>511 chars)")
+        
         elif linea.startswith("NACK,"):
             motivo = linea[5:].strip() or "desconocido"
             self.ganancias_ack.emit(False, motivo, {})
@@ -867,7 +901,7 @@ class PhasePanel(QtWidgets.QWidget):
 
     def _on_modo_x(self, idx):
         self.modo_x = idx
-        self.plot.setLabel('bottom', 'θ (rad)' if idx == 0 else 'e = θ − π, envuelto (rad)')
+        self.plot.setLabel('bottom', 'θ (rad)' if idx == 0 else 'e = θ - π, envuelto (rad)')
         self._aplicar_referencias()
         self._dibujar()
 
@@ -1274,16 +1308,28 @@ class InterfazPendulo(QtWidgets.QMainWindow):
 
     MODOS = [
         ("STANDBY",       "En Espera / Stop"),
-        ("MANUAL",        "Modo Manual (Teclas)"),
-        ("OPEN_LOOP",     "Lazo Abierto (Identificación)"),
-        ("STABILIZATION", "Lazo Cerrado (Estabilización)"),
-        ("AUTO",          "Automático (Swing-up + Estab.)"),
+        ("MANUAL",        "Modo Manual (Teclas)[M]"),
+        ("OPEN_LOOP",     "Lazo Abierto (Identificación)[I]"),
+        ("STABILIZATION", "Lazo Cerrado (Estabilización)[L]"),
+        ("AUTO",          "Automático (Swing-up + Estab.)[S]"),
     ]
 
     # Teclas del modo manual
     TECLAS_MANUAL = {
         QtCore.Qt.Key.Key_Left: "LEFT",
         QtCore.Qt.Key.Key_Right: "RIGHT",
+    }
+
+    ATAJOS_MODO = {
+        "MANUAL":        "M",
+        "OPEN_LOOP":     "I",   # Identification
+        "STABILIZATION": "L",   # LQR
+        "AUTO":          "S",   # Swing-up
+    }
+
+    ATAJOS_ACCION = {
+        "RESET":  "R",
+        "GRABAR": "G",
     }
 
     def __init__(self):
@@ -1305,6 +1351,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self._ack_timer = QtCore.QTimer(self)
         self._ack_timer.setSingleShot(True)
         self._ack_timer.timeout.connect(self._on_ack_timeout)
+        self._expr_fw_on = False
 
         # Control manual: qué entradas (botón / tecla) están sostenidas
         self._manual_held = set()
@@ -1330,6 +1377,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self.u_buf= deque(maxlen=n)
         self.vel_other_buf = deque(maxlen=n)
         self.disco_other_buf = deque(maxlen=n)
+        self.phi_disco_buf = deque(maxlen=n)
 
         # ---------- Comunicación ----------
         self.serial = SerialManager(self)
@@ -1343,6 +1391,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self.serial.est_ack.connect(self._on_est_ack)
         self.serial.obs_ack.connect(self._on_obs_ack)
         self.serial.kal_ack.connect(self._on_kal_ack)
+        self.serial.expr_ack.connect(self._on_expr_ack)
 
         # ---------- UI ----------
         self._build_ui()
@@ -1361,6 +1410,8 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         # Atajo de emergencia: Esc = KILL SWITCH
         self._sc_kill = QtGui.QShortcut(QtGui.QKeySequence("Esc"), self)
         self._sc_kill.activated.connect(self._on_kill_switch)
+
+        self._crear_atajos()
 
         # ---------- Temporizadores ----------
         # La telemetría llega por UART a FS_HZ (100 Hz) desde el hilo lector; el
@@ -1451,6 +1502,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         layout_controles.addWidget(self._crear_grupo_conexion())
         layout_controles.addWidget(self._crear_grupo_modos())
         layout_controles.addWidget(self._crear_grupo_parametros())
+        layout_controles.addWidget(self._crear_grupo_control_personal())
         layout_controles.addWidget(self._crear_grupo_observador())
         layout_controles.addWidget(self._crear_grupo_lazo_abierto())
         layout_controles.addWidget(self._crear_grupo_grabacion())
@@ -1594,9 +1646,16 @@ class InterfazPendulo(QtWidgets.QMainWindow):
             btn.setObjectName("btnModo")
             btn.setCheckable(True)
             btn.setMinimumHeight(30)
+
+            #Descripción y atajo si tiene
+            partes_tip = []
             if clave == "MANUAL":
-                btn.setToolTip("Mantén pulsada ← o → para mover el disco; al soltar, el motor se detiene.\n"
-                               "Si la barra pasa por la vertical, el firmware pasa solo a Lazo Cerrado.")
+                partes_tip.append("Mover con las flechitas ← o →.\n")
+            if clave in self.ATAJOS_MODO:
+                partes_tip.append(f"Atajo de teclado: {self.ATAJOS_MODO[clave]}")
+            if partes_tip:
+                btn.setToolTip("\n".join(partes_tip))
+
             btn.clicked.connect(lambda _, k=clave: self._on_mode_changed(k))
             self.mode_group.addButton(btn)
             self.mode_buttons[clave] = btn
@@ -1815,7 +1874,65 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         v.addWidget(self.btn_send_wmaxi)
 
         return g
+    
+    def _on_preview_expr(self):
+        eq = self.le_expr_custom.text().strip()
+        if not eq:
+            QtWidgets.QMessageBox.information(self, "Vacío", "Escribí primero una ecuación.")
+            return
+        try:
+            # Validación rápida: compilar una vez en Python para detectar sintaxis
+            compile(eq, "<expr>", "eval")
+        except SyntaxError as e:
+            QtWidgets.QMessageBox.critical(self, "Sintaxis",
+                f"Ecuación inválida:\n{e}")
+            return
+        EquationPreviewDialog(eq, self.sp_wmaxi.value(), self).exec()
+    
+    def _crear_grupo_control_personal(self):
+        g = QtWidgets.QGroupBox("Control Personalizado (Swing-Wp)")
+        v = QtWidgets.QVBoxLayout(g)
 
+        info = QtWidgets.QLabel(
+            "Control de Swing-Up personalizado.\n"
+            "Variables disponibles:\n"
+            "theta, w_barra, w_disco, u_prev, wmaxi (multiplicador de E),\n"
+            "e, E, E0, q1, q2, q3, rho\n"
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("font-size: 9pt; color: #555555;")
+        v.addWidget(info)
+
+        self.le_expr_custom = QtWidgets.QLineEdit()
+        self.le_expr_custom.setPlaceholderText("Ej: 10*sin(theta) - 2*w_barra")
+        self.le_expr_custom.returnPressed.connect(self._on_send_expr)
+        self.le_expr_custom.textChanged.connect(self._actualizar_indicador_expr)
+        v.addWidget(self.le_expr_custom)
+
+        h = QtWidgets.QHBoxLayout()
+        self.btn_send_expr = QtWidgets.QPushButton("▶ Aplicar Ecuación")
+        self.btn_send_expr.setStyleSheet(ESTILO_ENVIAR)
+        self.btn_send_expr.clicked.connect(self._on_send_expr)
+        
+        self.btn_reset_expr = QtWidgets.QPushButton("↺ Volver al Default")
+        self.btn_reset_expr.setStyleSheet(ESTILO_GRABAR)
+        self.btn_reset_expr.clicked.connect(self._on_reset_expr)
+
+        self.btn_preview = QtWidgets.QPushButton("👁 Previsualizar")
+        self.btn_preview.clicked.connect(self._on_preview_expr)
+        v.addWidget(self.btn_preview)
+
+        self.lbl_expr_estado = QtWidgets.QLabel("")
+        self.lbl_expr_estado.setStyleSheet("font-style: italic; font-size: 9pt;")
+        v.addWidget(self.lbl_expr_estado)
+        
+        h.addWidget(self.btn_send_expr)
+        h.addWidget(self.btn_reset_expr)
+        v.addLayout(h)
+        
+        return g
+
+    
     # ---- Grupo: observador ----
     def _crear_editor_4x2(self, titulo, keys, valores, prefijo_tip, placeholder, tip_paste, on_send, on_paste):
         w = QtWidgets.QWidget()
@@ -1926,7 +2043,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         g = QtWidgets.QGroupBox("Grabación y Exportación")
         v = QtWidgets.QVBoxLayout(g)
 
-        self.btn_record = QtWidgets.QPushButton("● Iniciar Grabación")
+        self.btn_record = QtWidgets.QPushButton("● Iniciar Grabación [G]")
         self.btn_record.setMinimumHeight(34)
         self.btn_record.setStyleSheet(ESTILO_GRABAR)
         self.btn_record.clicked.connect(self._on_toggle_record)
@@ -1954,9 +2071,14 @@ class InterfazPendulo(QtWidgets.QMainWindow):
     def _update_gain_button_state(self):
         puede = (not self.motor_moving) and self.serial.handshake_completo
         self.btn_send_gains.setEnabled(puede)
-        self.btn_zero.setEnabled(puede)               # <-- NUEVO
+        self.btn_zero.setEnabled(puede)       
+        self.btn_preview.setEnabled(puede)       
         for le in self.inputs_L.values():
             le.setEnabled(puede)
+        #control custom para alumnos
+        self.btn_send_expr.setEnabled(puede)
+        self.btn_reset_expr.setEnabled(puede)
+        self.le_expr_custom.setEnabled(puede)
 
         # WMAXI: se puede ajustar con el motor en marcha si hay handshake
         puede_wmaxi = self.serial.handshake_completo
@@ -2110,7 +2232,49 @@ class InterfazPendulo(QtWidgets.QMainWindow):
                                     tipo == QtCore.QEvent.Type.KeyPress)
                 return True
         return super().eventFilter(obj, event)
+    
+    def _atajo_modo(self, modo):
+        """Wrapper para dar feedback cuando no se puede cambiar de modo por atajo."""
+        if not self.serial.handshake_completo:
+            self._mostrar_evento("⚠ Sin conexión: handshake no establecido", ms=4000, color="#b00")
+            return
+        self._on_mode_changed(modo)
 
+    def _atajo_reset(self):
+        if not self.serial.handshake_completo:
+            self._mostrar_evento("⚠ Sin conexión para Reset", ms=4000, color="#b00")
+            return
+        if self.motor_moving:
+            self._mostrar_evento("⚠ No se puede hacer Reset con el motor en movimiento", ms=4000, color="#b00")
+            return
+        self._on_zero()
+    
+    def _atajo_grabar(self):
+        if not self.recording and not self.serial.handshake_completo:
+            self._mostrar_evento("⚠ Sin conexión para grabar", ms=4000, color="#b00")
+            return
+        self._on_toggle_record()
+    
+    def _crear_atajos(self):
+        self._atajos = []
+
+        def add(tecla, slot):
+            sc = QtGui.QShortcut(QtGui.QKeySequence(tecla),self)
+            sc.setContext(QtCore.Qt.ShortcutContext.WindowShortcut)
+            sc.activated.connect(slot)
+            self._atajos.append(sc)
+
+        #Modos
+        add(self.ATAJOS_MODO["MANUAL"], lambda: self._atajo_modo("MANUAL"))
+        add(self.ATAJOS_MODO["OPEN_LOOP"],     lambda: self._atajo_modo("OPEN_LOOP"))
+        add(self.ATAJOS_MODO["STABILIZATION"], lambda: self._atajo_modo("STABILIZATION"))
+        add(self.ATAJOS_MODO["AUTO"],          lambda: self._atajo_modo("AUTO"))
+
+        #Acciones
+        add(self.ATAJOS_ACCION["RESET"],  self._atajo_reset)
+        add(self.ATAJOS_ACCION["GRABAR"], self._atajo_grabar)
+
+    
     def showEvent(self, event):
         super().showEvent(event)
         # Reaplicar el tema del título tras el primer show: DWM a veces
@@ -2248,6 +2412,10 @@ class InterfazPendulo(QtWidgets.QMainWindow):
                         if k in kal: self.inputs_kal[k].setText(f"{kal[k]:.6g}")
             self._sincronizado = True
 
+        if info.get('EXPR') is not None:
+            self._expr_fw_on = bool(info['EXPR'])
+            self._actualizar_indicador_expr()
+        
         self._set_controles_conectados(True)
 
         # Sincronizar la UI con el modo que reporta el firmware
@@ -2281,6 +2449,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self._forzar_standby()
         detenida = self._detener_grabacion()
         self._set_controles_conectados(False)
+        self._actualizar_indicador_expr()
         self._mostrar_evento("⚠ Handshake perdido con el ESP32", ms=10000)
         if detenida:
             self._ofrecer_exportar_tras_corte()
@@ -2295,6 +2464,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self.u_buf.clear()
         self.vel_other_buf.clear()
         self.disco_other_buf.clear()
+        self.phi_disco_buf.clear()
         self.panel_fase.limpiar()
         self.panel_esquema.limpiar() 
         for panel in self._paneles_graficas.values():     # incluye la gráfica de u
@@ -2331,6 +2501,24 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         if self.serial.connected:
             self.serial.enviar_ping()
 
+    def _actualizar_indicador_expr(self):
+        if not self.serial.handshake_completo:
+            self.lbl_expr_estado.setText("")
+            return
+        campo_vacio = not self.le_expr_custom.text().strip()
+        if self._expr_fw_on and campo_vacio:
+            self.lbl_expr_estado.setText(
+                "⚠ Hay una ecuación activa en el firmware, pero el campo está vacío."
+                " Reenviá la ecuación o pulsá «Volver al Default»."
+            )
+            self.lbl_expr_estado.setStyleSheet("color: #b00; font-size: 9pt; font-style: italic;")
+        elif self._expr_fw_on:
+            self.lbl_expr_estado.setText("● Ecuación activa en el firmware.")
+            self.lbl_expr_estado.setStyleSheet("color: #2e7d32; font-size: 9pt; font-style: italic;")
+        else:
+            self.lbl_expr_estado.setText("○ Firmware usa el swing-up por energía por defecto.")
+            self.lbl_expr_estado.setStyleSheet("color: #666; font-size: 9pt; font-style: italic;")
+    
     def _on_send_gains(self):
         if not self.serial.handshake_completo:
             QtWidgets.QMessageBox.warning(
@@ -2512,6 +2700,38 @@ class InterfazPendulo(QtWidgets.QMainWindow):
             return
         self.serial.enviar_kal(nuevas)
 
+    def _on_send_expr(self):
+        if not self.serial.handshake_completo:
+            QtWidgets.QMessageBox.warning(self, "Sin conexión", "No hay handshake")
+            return
+
+        eq = self.le_expr_custom.text().strip()
+        if not eq:
+            return
+
+        self.serial.enviar_expr(eq)
+        self._mostrar_evento("⏳ Compilando ecuación...", ms=3000, color= "#078da7")
+
+    def _on_reset_expr(self):
+        if not self.serial.handshake_completo: return
+        self.serial.enviar_expr("RESET")
+        self.le_expr_custom.clear()
+
+    @QtCore.pyqtSlot(bool, str)
+    def _on_expr_ack(self, ok: bool, error_pos: str):
+        if ok:
+            if error_pos == "RESET":
+                self._expr_fw_on = False
+                self._mostrar_evento("✔ Swing-Up restaurado al original", ms=6000, color="#2e7d32")
+            else:
+                self._expr_fw_on = True
+                self._mostrar_evento("✔ Compilada y aplicada", ms=6000, color="#2e7d32")
+        else:
+            self._mostrar_evento(f"⚠ Error de sintaxis en la posición: {error_pos}",
+                                ms=8000, color="#b00")
+        self._actualizar_indicador_expr()
+
+    
     @QtCore.pyqtSlot(bool, dict, str)
     def _on_kal_ack(self, ok: bool, kal: dict, motivo: str):
         if ok:
@@ -2641,8 +2861,9 @@ class InterfazPendulo(QtWidgets.QMainWindow):
 
         # 3) Botones "Enviar" (usan hoja propia, no la global)
         estilo_enviar = ESTILO_ENVIAR_BATMAN if activo else ESTILO_ENVIAR_CLARO
-        for btn in (self.btn_exc_start, self.btn_send_gains,
-                    self.btn_send_wmaxi, self.btn_send_obs, self.btn_send_kal, self.btn_apply_est):
+        for btn in (self.btn_exc_start, self.btn_send_gains, self.btn_send_wmaxi,
+                    self.btn_send_obs, self.btn_send_kal, self.btn_apply_est,
+                    self.btn_send_expr, self.btn_preview):
             btn.setStyleSheet(estilo_enviar)
 
         # 4) Avisos rojo-oscuro: sobre fondo negro casi no se leen
@@ -2664,11 +2885,14 @@ class InterfazPendulo(QtWidgets.QMainWindow):
             self.recorded_data = []
             self.btn_record.setText("■ Detener y Exportar CSV")
             self.lbl_record.setText("Muestras grabadas: 0")
+            self._mostrar_evento("● Grabando telemetría...", ms=4000, color="#2e7d32")
             print("[UI] Grabación iniciada")
         else:
             self.recording = False
-            self.btn_record.setText("● Iniciar Grabación")
-            print(f"[UI] Grabación detenida. Total: {len(self.recorded_data)} muestras")
+            self.btn_record.setText("● Iniciar Grabación [G]")
+            n = len(self.recorded_data)
+            self._mostrar_evento(f"■ Grabación detenida ({n} muestras)", ms=6000, color="#2e7d32")
+            print(f"■ Grabación detenida ({n} muestras)")
             self._exportar_csv()
 
     def _exportar_csv(self):
@@ -2685,7 +2909,9 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         try:
             with open(fname, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
-                w.writerow(["t_s", "theta_rad", "omega_rad_s", "v_disco_rad_s", "u_ctrl", "omega_other_rad_s", "v_disco_other_rad_s"])
+                w.writerow(["t_s", "theta_rad", "omega_rad_s", "v_disco_rad_s",
+                             "u_ctrl", "omega_other_rad_s", "v_disco_other_rad_s",
+                             "phi_disco_rad"])
                 w.writerows(self.recorded_data)
             QtWidgets.QMessageBox.information(
                 self, "Exportado",
@@ -2697,8 +2923,8 @@ class InterfazPendulo(QtWidgets.QMainWindow):
     # -----------------------------------------------------------------
     #  Telemetría y refresco
     # -----------------------------------------------------------------
-    @QtCore.pyqtSlot(float, float, float, float, float, float, float)
-    def _on_muestra(self, t, theta, omega, v_disco, u, omega_other, v_disco_other):
+    @QtCore.pyqtSlot(float, float, float, float, float, float, float, float)
+    def _on_muestra(self, t, theta, omega, v_disco, u, omega_other, v_disco_other, phi_disco):
         """Punto único de entrada de datos."""
         self.t_buf.append(t)
         self.pos_buf.append(theta)
@@ -2707,9 +2933,10 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self.u_buf.append(u)
         self.vel_other_buf.append(omega_other)
         self.disco_other_buf.append(v_disco_other)
+        self.phi_disco_buf.append(phi_disco)
 
         if self.recording:
-            self.recorded_data.append((t, theta, omega, v_disco, u, omega_other, v_disco_other))
+            self.recorded_data.append((t, theta, omega, v_disco, u, omega_other, v_disco_other, phi_disco))
 
     def _plot_tick(self):
         """Refresco visual desacoplado de la adquisición para mantener la UI fluida."""
@@ -2771,6 +2998,115 @@ class InterfazPendulo(QtWidgets.QMainWindow):
                 self.lbl_record.setText(f"Muestras grabadas: {len(self.recorded_data)}")
             self._update_status_bar()
 
+def _simular_ecuacion(expr_str, wmaxi_mult, T_sim=10.0, dt=1.0/500.0,
+                      theta0=0.1, omega0=0.0):
+    """Integra θ̈ = -q1·sinθ - q3·u + q2·ωd,  ω̇d = rho·(q3·u - q2·ωd) - θ̈.
+    Devuelve (t, θ, ωbarra, ωdisco, u, E, E0)."""
+    code = compile(expr_str, "<expr>", "eval")
+    q1, q2, q3, rho = PEND_Q1, PEND_Q2, PEND_Q3, PEND_RHO
+    E0 = 2.0 * q1 * rho
+
+    n = int(T_sim / dt)
+    t_a   = np.zeros(n)
+    th_a  = np.zeros(n)
+    w_a   = np.zeros(n)
+    wd_a  = np.zeros(n)
+    u_a   = np.zeros(n)
+    E_a   = np.zeros(n)
+    th, w, wd, u_prev = theta0, omega0, 0.0, 0.0
+
+    # Namespace restringido (sin builtins, sin math.e para no pisar 'e')
+    base = {
+        "sin": math.sin, "cos": math.cos, "tan": math.tan,
+        "asin": math.asin, "acos": math.acos, "atan": math.atan,
+        "atan2": math.atan2, "sqrt": math.sqrt, "exp": math.exp,
+        "log": math.log10, "ln": math.log, "abs": abs,
+        "pi": math.pi,
+        "q1": q1, "q2": q2, "q3": q3, "rho": rho,
+    }
+
+    for i in range(n):
+        t_now = i * dt
+        E = 0.5 * rho * w * w + q1 * rho * (1.0 - math.cos(th))
+        e_err = (th - math.pi) - 2*math.pi*round((th - math.pi)/(2*math.pi))
+
+        env = dict(base)
+        env.update(theta=th, w_barra=w, w_disco=wd, u_prev=u_prev,
+                   wmaxi=wmaxi_mult, e=e_err, E=E, E0=E0)
+        try:
+            u = float(eval(code, {"__builtins__": {}}, env))
+        except Exception as ex:
+            raise RuntimeError(f"Evaluación falló en t={t_now:.3f} s: {ex}")
+        if not math.isfinite(u):
+            u = 0.0
+        u = max(-PEND_UMAX, min(PEND_UMAX, u))
+
+        th_ddot = -q1 * math.sin(th) - q3 * u + q2 * wd
+        wd_ddot = rho * (q3 * u - q2 * wd) - th_ddot
+
+        w  += th_ddot * dt
+        th += w * dt
+        wd += wd_ddot * dt
+        u_prev = u
+
+        t_a[i], th_a[i], w_a[i], wd_a[i], u_a[i] = t_now, th, w, wd, u
+        E_a[i] = 0.5 * rho * w * w + q1 * rho * (1.0 - math.cos(th))
+
+    return t_a, th_a, w_a, wd_a, u_a, E_a, np.full_like(E_a, E0)
+
+class EquationPreviewDialog(QtWidgets.QDialog):
+    def __init__(self, expr_str, wmaxi_mult, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Vista previa — simulación 10 s")
+        self.resize(860, 720)
+        self._expr = expr_str
+        self._wmaxi = wmaxi_mult
+
+        v = QtWidgets.QVBoxLayout(self)
+        self.glw = pg.GraphicsLayoutWidget()
+        self.p_th  = self.glw.addPlot(row=0, col=0, title="θ (rad)")
+        self.p_w   = self.glw.addPlot(row=1, col=0, title="ω_barra (rad/s)")
+        self.p_E   = self.glw.addPlot(row=2, col=0, title="E vs E₀ (J)")
+        for p in (self.p_th, self.p_w, self.p_E):
+            p.showGrid(x=True, y=True, alpha=0.25)
+        self.c_th  = self.p_th.plot(pen=pg.mkPen('#1976D2', width=2))
+        self.c_w   = self.p_w.plot(pen=pg.mkPen('#E53935', width=2))
+        self.c_E   = self.p_E.plot(pen=pg.mkPen('#43A047', width=2), name="E")
+        self.c_E0  = self.p_E.plot(pen=pg.mkPen('#424242', width=1,
+                                                style=QtCore.Qt.PenStyle.DashLine), name="E₀")
+        v.addWidget(self.glw, stretch=1)
+
+        self.lbl = QtWidgets.QLabel("—")
+        self.lbl.setStyleSheet("font-family: monospace; font-size: 10pt;")
+        v.addWidget(self.lbl)
+
+        h = QtWidgets.QHBoxLayout()
+        btn_re  = QtWidgets.QPushButton("Re-simular")
+        btn_re.clicked.connect(self._run)
+        btn_ok  = QtWidgets.QPushButton("Cerrar")
+        btn_ok.clicked.connect(self.accept)
+        h.addWidget(btn_re); h.addStretch(); h.addWidget(btn_ok)
+        v.addLayout(h)
+
+        self._run()
+
+    def _run(self):
+        try:
+            t, th, w, wd, u, E, E0 = _simular_ecuacion(self._expr, self._wmaxi)
+        except Exception as ex:
+            self.lbl.setText(f"⚠ {ex}")
+            self.c_th.setData([], []); self.c_w.setData([], [])
+            self.c_E.setData([], []);  self.c_E0.setData([], [])
+            return
+        self.c_th.setData(t, th)
+        self.c_w.setData(t, w)
+        self.c_E.setData(t, E)
+        self.c_E0.setData(t, E0)
+        e_final = (th[-1] - math.pi) - 2*math.pi*round((th[-1] - math.pi)/(2*math.pi))
+        self.lbl.setText(
+            f"t_fin = {t[-1]:.1f} s   |   e_final = {math.degrees(e_final):+6.2f}°"
+            f"   |   E_final / E₀ = {E[-1]/E0[-1]:.3f}   |   |u|_max = {np.abs(u).max():.2f}"
+        )
 
 # =====================================================================
 #  Entry point

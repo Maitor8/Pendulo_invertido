@@ -14,6 +14,7 @@
 #include "esp_err.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "tinyexpr.h"
 
 //===================
 //Defines
@@ -63,6 +64,7 @@
 #define TIMEOUT_MOTOR_MS      1500    //motor activo y sin tráfico de la GUI -> STANDBY
 #define WATCHDOG_PERIODO_MS   250     //cada cuánto se revisa el timeout
 #define SOBREVEL_ACTIVO       1       //0 desactiva el freno por RPM_MAX (no recomendado)
+#define RX_LINE_MAX           512
 
 //Ctes de energía para el swing-up
 #define PEND_Q1          26.0736f//param q1
@@ -86,12 +88,6 @@
 #define BALANCE_SIGN  1.0f
 
 #define DIFERENCIAS 3
-
-//Núcleos (control aislado de la comunicación)
-//vTaskDelayUntil trabaja en ticks: el periodo de control debe ser un número entero de ticks.
-//Con CONFIG_FREERTOS_HZ=100 (por defecto) 5 ms = 0 ticks. Subirlo a 1000 en menuconfig.
-// _Static_assert((PEND_TS_MS * configTICK_RATE_HZ) % 1000 == 0 && (PEND_TS_MS * configTICK_RATE_HZ) >= 1000,
-//                "PEND_TS_MS debe ser multiplo del tick de FreeRTOS: poner CONFIG_FREERTOS_HZ=1000");
 
 #if CONFIG_FREERTOS_UNICORE
   #define CORE_CTRL 0
@@ -148,10 +144,11 @@ typedef struct {
     float   omega_rueda;    //vel disco rad/s, obs seleccionado
     float theta_dot_other; //vel barra rad/s, obs no seleccionado
     float omega_other;      //vel disco rad/s, obs no seleccionado
+    float phi_disco;
     int16_t u;              //u*100 (u en unidades de control, ±PEND_UMax; no en volt)
 } paquete_t;
 #pragma pack(pop)
-_Static_assert(sizeof(paquete_t) == 28, "paquete_t debe medir 28 bytes (la GUI lee 2 + 26)");
+_Static_assert(sizeof(paquete_t) == 32, "paquete_t debe medir 32 bytes (la GUI lee 2 + 30)");
 
 //Balanceo
 typedef enum {
@@ -193,15 +190,15 @@ static volatile float wmaxi_pend_mult = 2.1f; //multiplicador de wmaxi, para el 
 
 //Estimador de velocidades (lo escribe RX solo en STANDBY; la tarea de control lee una copia)
 static volatile est_modo_t est_modo = EST_DIF;
-static obs_gains_t obs_g = {{0.0437,    0.0000},
+static obs_gains_t obs_g = {{{0.0437,    0.0000},
                             {0.0978,    0.0001},
                             {0.0000,    0.0338},
-                            {0.0000,    0.0181} };  
+                            {0.0000,    0.0181}} };  
                             
-static kal_gains_t kal_g = {{0.0437,    0.0000},
+static kal_gains_t kal_g = {{{0.0437,    0.0000},
                             {0.0978,    0.0001},
                             {0.0000,    0.0338},
-                            {0.0000,    0.0181} };  
+                            {0.0000,    0.0181}} };  
 
 static float phi_k[4][4]={ {1.0f   , 0.0050f,       0.0f,    0.0000f},
         { 0.0f,    1.0000f,         0.0f,    0.0001f},
@@ -217,6 +214,31 @@ static float kal_x[4]={0};
 static bool kal_init = false;
 static int32_t kal_cd_ref = 0;
 static float vb_kal = 0.0f, vd_kal = 0.0f;
+
+//Ecuación personalizada
+
+//Semaphoro para proteger variables exprsn
+static SemaphoreHandle_t expr_mtx = NULL;
+
+//Variables para la ecuación personalizada
+static char exprsn_str[128]="";
+static te_expr*exprsn = NULL;
+static bool usar_exprsn = false;
+static double expr_theta = 0.0; 
+static double expr_w_barra = 0.0;
+static double expr_w_disco = 0.0;
+static double expr_u_prev = 0.0;
+static double expr_wmaxi = 0.0;
+//
+static double expr_e  = 0.0;      // error a la vertical, envuelto
+static double expr_E  = 0.0;      // energía actual del péndulo
+static double expr_E0 = 0.0;      // energía objetivo (péndulo arriba)
+static double expr_q1 = PEND_Q1;  // constantes (inmutables)
+static double expr_q2 = PEND_Q2;
+static double expr_q3 = PEND_Q3;
+static double expr_rho = PEND_RHO;
+
+
 
 //Handshake
 static volatile bool     handshake_ok        = false;
@@ -237,9 +259,9 @@ static auto_fase_t auto_fase = AUTO_SWINGUP;
 static bool    stab_capturada = false; //si se capturó la barra en vertical
 
 static int32_t cnt_b_act = 0, cnt_d_act = 0;   //cuentas acumuladas
-static float   pb = 0.0f;                      //ángulo barra [rad] 
+static float   pb = 0.0f, pd = 0.0f;                      //ángulo barra [rad] 
 
-static int32_t cnt_b_ref = 0; //cuentas de la barra 
+static int32_t cnt_b_ref = 0, cnt_d_ref = 0; //cuentas de la barra 
 static float wmaxi_mult = 2.1f; //multiplicador vigente
 
 
@@ -458,6 +480,11 @@ static void enviar_estado(void)
     kg= kal_g;
     portEXIT_CRITICAL(&estado_mux);
 
+    bool exp_on = false;
+    xSemaphoreTake(expr_mtx, portMAX_DELAY);
+    exp_on = usar_exprsn;
+    xSemaphoreGive(expr_mtx);
+
     char kal_str[160];
     fmt_kal(kal_str, sizeof(kal_str), &kg);
     char obs_str[160];
@@ -465,9 +492,9 @@ static void enviar_estado(void)
 
     char buf[512];
     int n = snprintf(buf, sizeof(buf),
-    "STATE,L=%.4f,%.4f,%.4f;MODE=%s;WMAXI=%.3f;EST=%s;OBS=%s;KAL=%s;PROTO=3\n",
+    "STATE,L=%.4f,%.4f,%.4f;MODE=%s;WMAXI=%.3f;EST=%s;OBS=%s;KAL=%s;EXPR=%s;PROTO=3\n",
                         g.l1, g.l2, g.l3, MODO_NOMBRE[m], wm, 
-                        EST_NOMBRE[em], obs_str, kal_str);
+                        EST_NOMBRE[em], obs_str, kal_str, exp_on ? "ON" : "OFF");
     if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
     if (n > 0) uart_write_bytes(UART_NUM, buf, n);
 }
@@ -498,7 +525,7 @@ static bool exc_cfg_valida(const exc_cfg_t *c)
 {
     if (!isfinite(c->amp_pct) || c->amp_pct <= 0.0f || c->amp_pct > 100.0f) return false;
     if (!isfinite(c->dur)     || c->dur     <= 0.0f || c->dur     > 600.0f) return false;
-    switch (c->tipo) {
+    switch (c->tipo){
     case EXC_SQUARE:
         return isfinite(c->freq) && c->freq > 0.0f && c->freq <= 50.0f;
     case EXC_CHIRP:
@@ -519,14 +546,14 @@ static float exc_generar_u(void)
     int64_t ahora = esp_timer_get_time();
     float t = (ahora - exc_t_inicio_us) / 1e6f;
 
-    if (t >= exc_act.dur) {
+    if (t >= exc_act.dur){
         exc_act.tipo = EXC_NINGUNA;
         return 0.0f;
     }
 
     float amp = (exc_act.amp_pct / 100.0f) * PEND_UMax;
 
-    switch (exc_act.tipo) {
+    switch (exc_act.tipo){
     case EXC_SQUARE: {
         float fase = 2.0f * PI_F * exc_act.freq * t;
         return (sinf(fase) >= 0.0f) ? amp : -amp;
@@ -538,7 +565,7 @@ static float exc_generar_u(void)
     }
     case EXC_PRBS: {
         int64_t periodo_us = (int64_t)(1e6f / exc_act.bitrate);
-        if ((ahora - prbs_t_ultimo_bit_us) >= periodo_us) {
+        if ((ahora - prbs_t_ultimo_bit_us) >= periodo_us){
             prbs_bit_actual      = prbs_next_bit();
             prbs_t_ultimo_bit_us = ahora;
         }
@@ -552,8 +579,8 @@ static float exc_generar_u(void)
 //Para resetear el observador trucho
 static void resetear_estimador(void)
 {
-    for (int i = 0; i < DIFERENCIAS; i++) { cb_hist[i] = cnt_b_act; cd_hist[i] = cnt_d_act; }
-    for (int i = 0; i < FD_FILTRO_N; i++) {
+    for (int i = 0; i < DIFERENCIAS; i++){ cb_hist[i] = cnt_b_act; cd_hist[i] = cnt_d_act; }
+    for (int i = 0; i < FD_FILTRO_N; i++){
         vbarra_hist[i] = 0.0f;
         vdisco_hist[i] = 0.0f;
     }
@@ -586,25 +613,28 @@ static void aplicar_comandos_pendientes(void)
     cfg           = exc_pend;
     portEXIT_CRITICAL(&estado_mux);
 
-    if (reset) {
+    if (reset){
         resetear_estimador();
         auto_fase = AUTO_SWINGUP;
         stab_capturada = false; 
     }
     if(zero && modo == MODO_STANDBY){
-        int cb = 0;
+        int cb = 0, cd = 0;
         pcnt_unit_get_count(pcnt_barra, &cb);
+        pcnt_unit_get_count(pcnt_disco, &cd);
         cnt_b_ref = cb;
+        cnt_d_ref = cd;
+        pd = 0.0f;
         obs_init = false;      //pb saltó: el observador se reinicia
         kal_init = false;
     }
     if(wm_req){
         wmaxi_mult = wm_val;
     }
-    if (ex_stop) {
+    if (ex_stop){
         exc_act.tipo = EXC_NINGUNA;
     }
-    if (ex_start) {
+    if (ex_start){
         exc_act              = cfg;
         prbs_lfsr            = 0xACE1u;
         prbs_bit_actual      = 1;
@@ -622,6 +652,7 @@ static void leer_encoders(void)
     cnt_b_act = cb;
     cnt_d_act = cd;
     pb = INVERTIR_BARRA * (float)(cb - cnt_b_ref) * RAD_POR_CUENTA;
+    pd = INVERTIR_DISCO * (float)(cd - cnt_d_ref) * RAD_POR_CUENTA;
 }
 
 //Error angular respecto a la vertical más cercana 
@@ -633,18 +664,43 @@ static float error_vertical(float ang)
 }
 
 //Swing-up por energía
-static float control_energia(void)
-{
+static float control_energia(void){
+        float u_pers = 0.0f;
+        bool usar    = false;
+
+        xSemaphoreTake(expr_mtx, portMAX_DELAY);
+        if (usar_exprsn && exprsn){
+        expr_theta   = pb;
+        expr_w_barra = vb_est;
+        expr_w_disco = vd_est;
+        expr_u_prev  = u_aplicada;
+        expr_wmaxi   = wmaxi_mult;
+        expr_e       = error_vertical(pb);
+        expr_E       = 0.5f * PEND_RHO * vb_est * vb_est
+                        + PEND_Q1 * PEND_RHO * (1.0f - cosf(pb));
+        expr_E0      = 2.0f * PEND_Q1 * PEND_RHO;
+        //Evaluar la ecuación ingresada
+        u_pers = (float)te_eval(exprsn);
+        usar         = true;
+        }
+        xSemaphoreGive(expr_mtx);
+
+        if (usar){
+            //Protección
+            if (!isfinite(u_pers)) u_pers = 0.0f;
+            
+            return SWING_SIGN * sat(u_pers, PEND_UMax);
+        }
     /* Discriminante: cuánta energía falta para llegar a Wmaxi */
     float PEND_WMAXI = wmaxi_mult * PEND_WMAXI_BASE;
 
     float discri = 2.0f * PEND_WMAXI
-                 - vb_est * vb_est * PEND_RHO
-                 - 2.0f * PEND_Q1 * PEND_RHO * (1.0f - cosf(pb));
+                - vb_est * vb_est * PEND_RHO
+                - 2.0f * PEND_Q1 * PEND_RHO * (1.0f - cosf(pb));
 
     float u;
 
-    if (discri < 0.0f) {
+    if (discri < 0.0f){
         /* Energía excesiva: amortiguar */
         u = -vb_est;
     } else {
@@ -668,7 +724,7 @@ static float control_energia(void)
 static float control_lqr(const ganancias_t *g)
 {
     float e = error_vertical(pb);
-    if (fabsf(e) > PEND_SALIDA_RAD) {
+    if (fabsf(e) > PEND_SALIDA_RAD){
         //considerar cambiar a modo standby
         return 0.0f;                     //lejos de la vertical
     }
@@ -682,15 +738,15 @@ static float control_auto(const ganancias_t *g)
 {
     float e_abs = fabsf(error_vertical(pb));
 
-    if (auto_fase == AUTO_SWINGUP) {
-        if (e_abs < PEND_CAPT_RAD) {     //cerca de la vertical?
+    if (auto_fase == AUTO_SWINGUP){
+        if (e_abs < PEND_CAPT_RAD){     //cerca de la vertical?
             auto_fase = AUTO_LQR;
             return control_lqr(g);
         }
         return control_energia();
     }
     //se cayó?
-    if (e_abs > PEND_SALIDA_RAD) {
+    if (e_abs > PEND_SALIDA_RAD){
         auto_fase = AUTO_SWINGUP;
         return control_energia();
     }
@@ -700,7 +756,7 @@ static float control_auto(const ganancias_t *g)
 //Control por modo
 static float calcular_control(modo_t m, const ganancias_t *g)
 {
-    switch (m) {
+    switch (m){
     case MODO_MANUAL:
         //Deadman: si la GUI dejó de refrescar la orden, parar
         if ((uint32_t)(ms_now() - t_manual_ms) > MANUAL_DEADMAN_MS) return 0.0f;
@@ -756,7 +812,7 @@ static void actualizar_estimador_fd(int32_t cb, int32_t cd)
 static bool obs_validar(const obs_gains_t *g)
 {
     const float *p = &g->K[0][0];
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 8; i++){
         if (!isfinite(p[i]) || fabsf(p[i]) > 1e4f) return false;
     }
     return true;
@@ -767,7 +823,7 @@ static void actualizar_observador(const obs_gains_t *og)
 {
     const float Ts = PEND_TS_S;
 
-    if (!obs_init) {
+    if (!obs_init){
         obs_cb_prev = cnt_b_act;  obs_cd_prev = cnt_d_act;  obs_pb_prev = pb;
         obs_db = obs_dd = obs_wb = obs_wd = 0.0f;
         vb_obs = vd_obs = 0.0f;
@@ -804,7 +860,7 @@ static void actualizar_observador(const obs_gains_t *og)
     obs_cb_prev = cnt_b_act;  obs_cd_prev = cnt_d_act;  obs_pb_prev = pb;
 
     //Protección: si algo diverge, se reinicia en vez de propagar basura al control
-    if (!isfinite(obs_wb) || !isfinite(obs_wd) || fabsf(obs_wb) > 1e3f || fabsf(obs_wd) > 1e4f) {
+    if (!isfinite(obs_wb) || !isfinite(obs_wd) || fabsf(obs_wb) > 1e3f || fabsf(obs_wd) > 1e4f){
         obs_init = false;
         vb_obs = vd_obs = 0.0f;
         return;
@@ -869,11 +925,11 @@ static void karmaland(const kal_gains_t *kg){
 //============================
 static void cmd_excitacion(const exc_cfg_t *cfg, const char *ack)
 {
-    if (!handshake_ok || modo != MODO_OPEN_LOOP) {
+    if (!handshake_ok || modo != MODO_OPEN_LOOP){
         responder("NACK,NOT_OPEN_LOOP\n");
         return;
     }
-    if (!exc_cfg_valida(cfg)) {
+    if (!exc_cfg_valida(cfg)){
         responder("NACK,BAD_VALUE\n");
         return;
     }
@@ -887,61 +943,127 @@ static void cmd_excitacion(const exc_cfg_t *cfg, const char *ack)
 
 static void procesar_linea(const char *l)
 {
-    if (strcmp(l, "PING") == 0) {
+    if (strcmp(l, "PING") == 0){
         //Heartbeat, solo refresca t_ultimo_comando_ms
         //tal vez quitarlo, ya se hace en recepción
     }
-    else if (strcmp(l, "READY") == 0) {
-        if (!handshake_ok) {
+    else if (strcmp(l, "READY") == 0){
+        if (!handshake_ok){
             handshake_ok = true;
             ir_a_standby();
         }
         enviar_estado();
     }
-    else if (strcmp(l, "HELLO?") == 0) {
+    else if (strcmp(l, "HELLO?") == 0){
         handshake_ok = false;
+        //Arranca con el campo vacío
+        te_expr *vieja = NULL;
+        xSemaphoreTake(expr_mtx, portMAX_DELAY);
+        vieja        = exprsn;
+        exprsn       = NULL;
+        usar_exprsn  = false;
+        exprsn_str[0] = '\0';
+        xSemaphoreGive(expr_mtx);
+        if (vieja) te_free(vieja);
         ir_a_standby();
         motor_set(0.0f, 0);
     }
-    else if (strncmp(l, "SQUARE:", 7) == 0) {
+    else if (strncmp(l, "SQUARE:", 7) == 0){
         exc_cfg_t c = { .tipo = EXC_SQUARE };
         if (sscanf(l + 7, "%f,%f,%f", &c.freq, &c.amp_pct, &c.dur) == 3)
             cmd_excitacion(&c, "ACK,EXC,SQUARE\n");
         else
             responder("NACK,BAD_FORMAT\n");
     }
-    else if (strncmp(l, "CHIRP:", 6) == 0) {
+    else if (strncmp(l, "CHIRP:", 6) == 0){
         exc_cfg_t c = { .tipo = EXC_CHIRP };
         if (sscanf(l + 6, "%f,%f,%f,%f", &c.f0, &c.f1, &c.dur, &c.amp_pct) == 4)
             cmd_excitacion(&c, "ACK,EXC,CHIRP\n");
         else
             responder("NACK,BAD_FORMAT\n");
     }
-    else if (strncmp(l, "PRBS:", 5) == 0) {
+    else if (strncmp(l, "PRBS:", 5) == 0){
         exc_cfg_t c = { .tipo = EXC_PRBS };
         if (sscanf(l + 5, "%f,%f,%f", &c.bitrate, &c.amp_pct, &c.dur) == 3)
             cmd_excitacion(&c, "ACK,EXC,PRBS\n");
         else
             responder("NACK,BAD_FORMAT\n");
     }
-    else if (strcmp(l, "EXC_STOP") == 0) {
+    else if (strcmp(l, "EXC_STOP") == 0){
         portENTER_CRITICAL(&estado_mux);
         exc_req_start = false;
         exc_req_stop  = true;
         portEXIT_CRITICAL(&estado_mux);
         responder("ACK,EXC,STOP\n");
     }
-    else if (strncmp(l, "MODE:", 5) == 0) {
-        if (!handshake_ok) {
+    else if (strncmp(l, "EXPR:",5)==0){
+        if(!handshake_ok){
+            responder("NACK,NO_HANDSHAKE\n");
+            return;
+        }
+        // Si pide resetear
+        if (strcmp(l + 5, "RESET") == 0){
+            te_expr *vieja = NULL;
+
+            xSemaphoreTake(expr_mtx, portMAX_DELAY);
+            vieja       = exprsn;
+            exprsn      = NULL;
+            usar_exprsn = false;
+            xSemaphoreGive(expr_mtx);
+
+            if (vieja) te_free(vieja);
+            responder("ACK,EXPR_RESET\n");
+            return;
+        }
+
+        // Si manda una nueva ecuación
+        int error_pos = 0;
+        // Definimos las variables disponibles para el alumno
+        te_variable vars[] = {
+            {"theta",   .address = &expr_theta},
+            {"w_barra", .address = &expr_w_barra},
+            {"w_disco", .address = &expr_w_disco},
+            {"u_prev",  .address = &expr_u_prev},
+            {"wmaxi",   .address = &expr_wmaxi},
+            {.name="e",       .address=&expr_e},
+            {.name="E",       .address=&expr_E},
+            {.name="E0",      .address=&expr_E0},
+            {.name="q1",      .address=&expr_q1},
+            {.name="q2",      .address=&expr_q2},
+            {.name="q3",      .address=&expr_q3},
+            {.name="rho",     .address=&expr_rho},
+        };
+        
+        te_expr *nueva_expr = te_compile(l + 5, vars, sizeof(vars)/sizeof(vars[0]), &error_pos);
+        
+        if (nueva_expr){
+            te_expr *vieja = NULL;
+            xSemaphoreTake(expr_mtx, portMAX_DELAY);
+            vieja       = exprsn;
+            exprsn      = nueva_expr;
+            usar_exprsn = true;
+            strncpy(exprsn_str, l + 5, sizeof(exprsn_str) - 1);
+            exprsn_str[sizeof(exprsn_str) - 1] = '\0';
+            xSemaphoreGive(expr_mtx);
+            if (vieja) te_free(vieja);                 // liberar FUERA del mutex
+            responder("ACK,EXPR_OK\n");
+        } else {
+            // Error de sintaxis
+            char nack[64];
+            snprintf(nack, sizeof(nack), "NACK,EXPR_BAD:%d\n", error_pos);
+            responder(nack);
+        }
+    }else if (strncmp(l, "MODE:", 5) == 0){
+        if (!handshake_ok){
             responder("NACK,NO_HANDSHAKE\n");
             return;
         }
         modo_t nuevo = MODO_STANDBY;
         bool ok = false;
-        for (int i = 0; i < MODO_N; i++) {
-            if (strcmp(l + 5, MODO_NOMBRE[i]) == 0) { nuevo = (modo_t)i; ok = true; break; }
+        for (int i = 0; i < MODO_N; i++){
+            if (strcmp(l + 5, MODO_NOMBRE[i]) == 0){ nuevo = (modo_t)i; ok = true; break; }
         }
-        if (!ok) {
+        if (!ok){
             responder("NACK,BAD_MODE\n");
             return;
         }
@@ -955,17 +1077,17 @@ static void procesar_linea(const char *l)
         portEXIT_CRITICAL(&estado_mux);
         enviar_estado();
     }
-    else if (strncmp(l, "L:", 2) == 0) {
-        if (!handshake_ok) {
+    else if (strncmp(l, "L:", 2) == 0){
+        if (!handshake_ok){
             responder("NACK,NO_HANDSHAKE\n");
-        } else if (modo != MODO_STANDBY) {
+        } else if (modo != MODO_STANDBY){
             responder("NACK,MOTOR_RUNNING\n");
         } else {
             ganancias_t g;
-            if (sscanf(l + 2, "%f,%f,%f", &g.l1, &g.l2, &g.l3) != 3) {
+            if (sscanf(l + 2, "%f,%f,%f", &g.l1, &g.l2, &g.l3) != 3){
                 responder("NACK,BAD_FORMAT\n");
             } else if (!isfinite(g.l1) || !isfinite(g.l2) || !isfinite(g.l3) ||
-                       fabsf(g.l1) > 1e6f || fabsf(g.l2) > 1e6f || fabsf(g.l3) > 1e6f) {
+                       fabsf(g.l1) > 1e6f || fabsf(g.l2) > 1e6f || fabsf(g.l3) > 1e6f){
                 responder("NACK,BAD_VALUE\n");
             } else {
                 portENTER_CRITICAL(&estado_mux);
@@ -978,17 +1100,17 @@ static void procesar_linea(const char *l)
             }
         }
     }
-    else if (strncmp(l, "EST:", 4) == 0) {
-        if (!handshake_ok) {
+    else if (strncmp(l, "EST:", 4) == 0){
+        if (!handshake_ok){
             responder("NACK,NO_HANDSHAKE\n");
-        } else if (modo != MODO_STANDBY) {
+        } else if (modo != MODO_STANDBY){
             responder("NACK,MOTOR_RUNNING\n");
         } else {
             int sel = -1;
             if      (strcmp(l + 4, "DIF") == 0) sel = EST_DIF;
             else if (strcmp(l + 4, "OBS") == 0) sel = EST_OBS;
             else if (strcmp(l + 4, "KAL")==0) sel = EST_KAL;
-            if (sel < 0) {
+            if (sel < 0){
                 responder("NACK,BAD_VALUE\n");
             } else {
                 portENTER_CRITICAL(&estado_mux);
@@ -1001,19 +1123,19 @@ static void procesar_linea(const char *l)
             }
         }
     }
-    else if (strncmp(l, "OBS:", 4) == 0) {
-        if (!handshake_ok) {
+    else if (strncmp(l, "OBS:", 4) == 0){
+        if (!handshake_ok){
             responder("NACK,NO_HANDSHAKE\n");
-        } else if (modo != MODO_STANDBY) {
+        } else if (modo != MODO_STANDBY){
             responder("NACK,MOTOR_RUNNING\n");
         } else {
             obs_gains_t g;
             float *p = &g.K[0][0];
             if (sscanf(l + 4, "%f,%f,%f,%f,%f,%f,%f,%f",
                     &p[0], &p[1], &p[2], &p[3],
-                    &p[4], &p[5], &p[6], &p[7]) != 8) {
+                    &p[4], &p[5], &p[6], &p[7]) != 8){
                 responder("NACK,BAD_FORMAT\n");
-            } else if (!obs_validar(&g)) {
+            } else if (!obs_validar(&g)){
                 responder("NACK,OBS_UNSTABLE\n");
             } else {
                 portENTER_CRITICAL(&estado_mux);
@@ -1028,19 +1150,19 @@ static void procesar_linea(const char *l)
             }
         }
     }
-    else if (strncmp(l, "KAL:", 4) == 0) {
-        if (!handshake_ok) {
+    else if (strncmp(l, "KAL:", 4) == 0){
+        if (!handshake_ok){
             responder("NACK,NO_HANDSHAKE\n");
-        } else if (modo != MODO_STANDBY) {
+        } else if (modo != MODO_STANDBY){
             responder("NACK,MOTOR_RUNNING\n");
         } else {
             kal_gains_t g;
             float *p = &g.Ka[0][0];
             if (sscanf(l + 4, "%f,%f,%f,%f,%f,%f,%f,%f",
                     &p[0], &p[1], &p[2], &p[3],
-                    &p[4], &p[5], &p[6], &p[7]) != 8) {
+                    &p[4], &p[5], &p[6], &p[7]) != 8){
                 responder("NACK,BAD_FORMAT\n");
-            } else if (!kal_validar(&g)) {
+            } else if (!kal_validar(&g)){
                 responder("NACK,KAL_UNSTABLE\n");
             } else {
                 portENTER_CRITICAL(&estado_mux);
@@ -1055,15 +1177,15 @@ static void procesar_linea(const char *l)
             }
         }
     }
-    else if (strcmp(l, "ESTOP") == 0) {
+    else if (strcmp(l, "ESTOP") == 0){
         ir_a_standby();
         motor_set(0.0f, 0);
         if (handshake_ok) enviar_estado();
     }
-    else if (strcmp(l, "ZERO") == 0) {
-        if (!handshake_ok) {
+    else if (strcmp(l, "ZERO") == 0){
+        if (!handshake_ok){
             responder("NACK,NO_HANDSHAKE\n");
-        } else if (modo != MODO_STANDBY) {
+        } else if (modo != MODO_STANDBY){
             responder("NACK,NOT_STANDBY\n");
         } else {
             portENTER_CRITICAL(&estado_mux);
@@ -1072,13 +1194,13 @@ static void procesar_linea(const char *l)
             responder("ACK,ZERO\n");            
         }
     }
-    else if (strncmp(l, "WMAXI:", 6) == 0) {
-        if (!handshake_ok) {
+    else if (strncmp(l, "WMAXI:", 6) == 0){
+        if (!handshake_ok){
             responder("NACK,NO_HANDSHAKE\n");
         } else {
             float m_val;
             if (sscanf(l + 6, "%f", &m_val) != 1 ||
-                !isfinite(m_val) || m_val < 0.1f || m_val > 20.0f) {
+                !isfinite(m_val) || m_val < 0.1f || m_val > 20.0f){
                 responder("NACK,BAD_VALUE\n");
             } else {
                 //Enter critical para que no se cambie wmaxi_pend_mult mientras la tarea de control lo lee
@@ -1092,12 +1214,12 @@ static void procesar_linea(const char *l)
             }
         }
     }
-    else if (strncmp(l, "MANUAL:", 7) == 0) {
-        if (handshake_ok && modo == MODO_MANUAL) {
+    else if (strncmp(l, "MANUAL:", 7) == 0){
+        if (handshake_ok && modo == MODO_MANUAL){
             const char *d = l + 7;
-            if      (strcmp(d, "LEFT")  == 0) { manual_izq = true;  manual_dcha = false; }
-            else if (strcmp(d, "RIGHT") == 0) { manual_izq = false; manual_dcha = true;  }
-            else if (strcmp(d, "STOP")  == 0) { manual_izq = false; manual_dcha = false; }
+            if      (strcmp(d, "LEFT")  == 0){ manual_izq = true;  manual_dcha = false; }
+            else if (strcmp(d, "RIGHT") == 0){ manual_izq = false; manual_dcha = true;  }
+            else if (strcmp(d, "STOP")  == 0){ manual_izq = false; manual_dcha = false; }
             t_manual_ms = ms_now();    
         }
     }
@@ -1110,30 +1232,32 @@ static void procesar_linea(const char *l)
 //Rx
 static void tarea_recepcion(void *param)
 {
-    char    rx_buffer[256];
+    char    rx_buffer[RX_LINE_MAX];
     int     rx_idx = 0;
     bool    descartando = false;
     uint8_t byte_rx;
 
-    while (1) {
+    while (1){
         int len = uart_read_bytes(UART_NUM, &byte_rx, 1, pdMS_TO_TICKS(100));
         if (len <= 0) continue;
 
         t_ultimo_comando_ms = ms_now();
 
-        if (byte_rx == '\n' || byte_rx == '\r') {
-            if (!descartando && rx_idx > 0) {
+        if (byte_rx == '\n' || byte_rx == '\r'){
+            if (descartando){
+                responder("NACK,TOO_LONG\n");          // Es muy grande
+            } else if (rx_idx > 0){
                 rx_buffer[rx_idx] = '\0';
                 procesar_linea(rx_buffer);
             }
             rx_idx = 0;
             descartando = false;
         }
-        else if (rx_idx < (int)sizeof(rx_buffer) - 1) {
+        else if (rx_idx < (int)sizeof(rx_buffer) - 1){
             rx_buffer[rx_idx++] = (char)byte_rx;
         }
         else {
-            descartando = true;          //línea demasiado larga
+            descartando = true;
         }
     }
 }
@@ -1149,7 +1273,7 @@ static void tarea_control(void *param)
     pkt.h2 = 0xBB;
     bool sobrevel_latch = false;
 
-    while (1) {
+    while (1){
         vTaskDelayUntil(&last_wake, periodo);
 
         int64_t t_now_us = esp_timer_get_time();
@@ -1178,9 +1302,9 @@ static void tarea_control(void *param)
         actualizar_estimador_fd(cnt_b_act, cnt_d_act);
         actualizar_observador(&og);
         karmaland(&kg); //actualiza el observador Kalman
-        if (em == EST_OBS) { vb_est = vb_obs; vd_est = vd_obs; }
+        if (em == EST_OBS){ vb_est = vb_obs; vd_est = vd_obs; }
         else
-        if (em == EST_KAL) { vb_est = vb_kal; vd_est = vd_kal; }
+        if (em == EST_KAL){ vb_est = vb_kal; vd_est = vd_kal; }
         else               { vb_est = vb_fd;  vd_est = vd_fd;  }
 
         //Atrapar la barra en manual
@@ -1192,7 +1316,7 @@ static void tarea_control(void *param)
                 //MODE: por la UART, no hay que pisarlo.
                 bool cambio = false;
                 portENTER_CRITICAL(&estado_mux);
-                if (modo == MODO_MANUAL) {
+                if (modo == MODO_MANUAL){
                     modo = MODO_STABILIZATION;
                     manual_izq = false;
                     manual_dcha = false;
@@ -1205,18 +1329,18 @@ static void tarea_control(void *param)
         }
 
        //Si se cae la barra en manual
-        if (m == MODO_STABILIZATION) {
+        if (m == MODO_STABILIZATION){
             float e_abs = fabsf(error_vertical(pb));
 
-            if (e_abs < PEND_CAPT_RAD) {
+            if (e_abs < PEND_CAPT_RAD){
                 stab_capturada = true;
             }
             //Solo pasa a standby si hubo captura antes
             
-            if (stab_capturada && e_abs > PEND_SALIDA_RAD) {
+            if (stab_capturada && e_abs > PEND_SALIDA_RAD){
                 bool cambio = false;
                 portENTER_CRITICAL(&estado_mux);
-                if (modo == MODO_STABILIZATION) {
+                if (modo == MODO_STABILIZATION){
                     modo        = MODO_STANDBY;
                     manual_izq  = false;
                     manual_dcha = false;
@@ -1239,10 +1363,10 @@ static void tarea_control(void *param)
     #endif
             bool  sobrevel  = sobrevel_latch;
 
-        if (sobrevel) {
+        if (sobrevel){
             //Protección: frenar el disco (contra-torque máximo)
             u = (rpm_disco > 0.0f) ? -PEND_UMax : PEND_UMax;
-        } else if (!handshake_ok || m == MODO_STANDBY) {
+        } else if (!handshake_ok || m == MODO_STANDBY){
             u = 0.0f;
         } else {
             u = calcular_control(m, &g);
@@ -1263,6 +1387,7 @@ static void tarea_control(void *param)
         pkt.theta       = pb;
         pkt.theta_dot   = vb_est;  
         pkt.omega_rueda = vd_est; 
+        pkt.phi_disco   = pd;
         pkt.u           = (int16_t)(u * 100.0f);
 
         if (em==EST_OBS){
@@ -1283,22 +1408,22 @@ static void tarea_hello(void *param)
     vTaskDelay(pdMS_TO_TICKS(300));
     uint32_t t_ult_hello = 0;
 
-    while (1) {
+    while (1){
         uint32_t ahora = ms_now();
 
-        if (handshake_ok) {
+        if (handshake_ok){
             //Con el motor activo el límite es más corto: si la GUI se cuelga o se suelta el
             //cable en pleno AUTO, el sistema no debe seguir actuando 5 s.
             uint32_t limite = (modo != MODO_STANDBY) ? TIMEOUT_MOTOR_MS : TIMEOUT_HANDSHAKE_MS;
-            if ((uint32_t)(ahora - t_ultimo_comando_ms) > limite) {
+            if ((uint32_t)(ahora - t_ultimo_comando_ms) > limite){
                 handshake_ok = false;
                 ir_a_standby();
                 motor_set(0.0f, 0);
             }
         }
-        if (!handshake_ok && (uint32_t)(ahora - t_ult_hello) >= PING_HELLO_MS) {
+        if (!handshake_ok && (uint32_t)(ahora - t_ult_hello) >= PING_HELLO_MS){
             t_ult_hello = ahora;
-            responder("HELLO,v2.2,PENDULO_ESP32\n");
+            responder("HELLO,v5.2,PENDULO_ESP32\n");
         }
         vTaskDelay(pdMS_TO_TICKS(WATCHDOG_PERIODO_MS));
     }
@@ -1315,7 +1440,9 @@ void app_main(void)
 
     t_ultimo_comando_ms = ms_now();
 
-    xTaskCreatePinnedToCore(tarea_recepcion, "recepcion", 6144, NULL, 5, NULL, CORE_COMM);
+    expr_mtx = xSemaphoreCreateMutex();
+
+    xTaskCreatePinnedToCore(tarea_recepcion, "recepcion", 10240, NULL, 5, NULL, CORE_COMM);
     xTaskCreatePinnedToCore(tarea_control,   "control",   8192, NULL, 6, NULL, CORE_CTRL);
     xTaskCreatePinnedToCore(tarea_hello,     "hello",     4096, NULL, 3, NULL, CORE_COMM);
 }
