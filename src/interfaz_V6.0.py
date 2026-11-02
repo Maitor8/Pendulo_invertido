@@ -28,12 +28,19 @@ except ImportError:
 #  CONFIGURACIÓN
 # =====================================================================
 FS_HZ = 200                   # telemetría del firmware: 1 / PEND_TS_MS (5 ms) = 200 Hz
-# Parámetros del pénd
+# Parámetros para la simulación
 PEND_Q1  = 26.0736
 PEND_Q2  = 0.0189
 PEND_Q3  = 0.3819
 PEND_RHO = 241.5725
 PEND_UMAX = 12.0000
+GANANCIAS_DEFAULT = (-248.9894, -48.6771, -0.1108)
+PEND_CAPT_RAD   = math.pi - 988.0 * math.pi / 1000.0
+PEND_SALIDA_RAD = math.pi - 0.98 * (988.0 * math.pi / 1000.0)
+PWM_MAX = 1023
+PWM_MIN = 50
+TS_CTRL = 0.005
+
 MANUAL_KEEPALIVE_MS = 150     # refresco de la orden manual, deadman
 PLOT_HZ = 20                  # refresco visual: 20 Hz es fluido y deja libre el event loop
 PLOT_DT_MS = round(1000 / PLOT_HZ)
@@ -69,10 +76,10 @@ ESTILO_GLOBAL_CLARO = """
     QTabWidget::pane { border: 1px solid #dcdcdc; background-color: #ffffff; }
     QTabBar::tab { background: #e0e0e0; color: #333333; padding: 6px 14px; border-top-left-radius: 4px; border-top-right-radius: 4px; }
     QTabBar::tab:selected { background: #ffffff; font-weight: bold; }
-    QLineEdit, QDoubleSpinBox, QComboBox {
+    QLineEdit, QPlainTextEdit, QDoubleSpinBox, QComboBox {
         background-color: #ffffff; color: #111111; border: 1px solid #cccccc; border-radius: 4px; padding: 3px 6px;
     }
-    QLineEdit:focus, QDoubleSpinBox:focus, QComboBox:focus { border: 1px solid #2196F3; }
+    QLineEdit:focus, QPlainTextEdit:focus, QDoubleSpinBox:focus, QComboBox:focus { border: 1px solid #2196F3; }
     QComboBox::drop-down { border: none; }
     QComboBox QAbstractItemView { background-color: #ffffff; color: #111111; selection-background-color: #2196F3; selection-color: white; }
     QPushButton { border-radius: 4px; padding: 4px 8px; background-color: #e0e0e0; color: #111111; border: 1px solid #cccccc; }
@@ -104,10 +111,10 @@ ESTILO_GLOBAL_BATMAN = """
     QTabWidget::pane { border: 1px solid #2d2d2d; background-color: #1a1a1a; }
     QTabBar::tab { background: #252525; color: #aaaaaa; padding: 6px 14px; border-top-left-radius: 4px; border-top-right-radius: 4px; }
     QTabBar::tab:selected { background: #1a1a1a; color: #00A8FF; font-weight: bold; }
-    QLineEdit, QDoubleSpinBox, QComboBox {
+    QLineEdit, QPlainTextEdit, QDoubleSpinBox, QComboBox {
         background-color: #252525; color: #ffffff; border: 1px solid #3d3d3d; border-radius: 4px; padding: 3px 6px;
     }
-    QLineEdit:focus, QDoubleSpinBox:focus, QComboBox:focus { border: 1px solid #00A8FF; }
+    QLineEdit:focus, QPlainTextEdit:focus, QDoubleSpinBox:focus, QComboBox:focus { border: 1px solid #00A8FF; }
     QComboBox::drop-down { border: none; }
     QComboBox QAbstractItemView { background-color: #252525; color: #ffffff; selection-background-color: #00A8FF; selection-color: white; }
     QPushButton { border-radius: 4px; padding: 4px 8px; background-color: #2a2a2a; color: #e0e0e0; border: 1px solid #383838; }
@@ -244,6 +251,49 @@ class NoWheelComboBox(QtWidgets.QComboBox):
 
     def wheelEvent(self, event):
         event.ignore()
+
+class EquationEditor(QtWidgets.QPlainTextEdit):
+    """Editor de ecuaciones que crece de 1 a N líneas y luego scrollea."""
+    def __init__(self, parent=None, min_lines=1, max_lines=4):
+        super().__init__(parent)
+        self._min_lines = min_lines
+        self._max_lines = max_lines
+        self._resizing = False
+        self.setTabChangesFocus(True)
+        self.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.textChanged.connect(self._auto_resize)
+        QtCore.QTimer.singleShot(0, self._auto_resize)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not self._resizing:
+            self._auto_resize()
+
+    def _count_visual_lines(self):
+        n = 0
+        block = self.document().firstBlock()
+        while block.isValid():
+            layout = block.layout()
+            n += max(1, layout.lineCount()) if layout else 1
+            block = block.next()
+        return max(1, n)
+
+    def _auto_resize(self):
+        if self._resizing:
+            return
+        self._resizing = True
+        try:
+            fm = self.fontMetrics()
+            line_h = max(1, fm.lineSpacing())
+            n_lines = self._count_visual_lines()
+            n_lines = max(self._min_lines, min(self._max_lines, n_lines))
+            h = line_h * n_lines + 2 * self.frameWidth() + 8
+            if self.height() != h:
+                self.setFixedHeight(h)
+        finally:
+            self._resizing = False
 
 class ScrollAwarePlotWidget(pg.PlotWidget):
     """Fix para el scroll en las gráficas."""
@@ -639,7 +689,7 @@ class SerialManager(QtCore.QObject):
 
         elif linea.startswith("NACK,TOO_LONG"):
             print("[UART] NACK: it's so big step bro")
-            self.expr_ack.emit(False, "TOO_LONG (>511 chars)")
+            self.expr_ack.emit(False, "IT'S SO BIG STEP BRO")
         
         elif linea.startswith("NACK,"):
             motivo = linea[5:].strip() or "desconocido"
@@ -1187,36 +1237,47 @@ class PendulumCanvas(QtWidgets.QWidget):
 
 class SchematicPanel(QtWidgets.QWidget):
     """
-    Panel contenedor de la pestaña de esquema animado en tiempo real.
+    Esquema animado. Dos fuentes:
+      · EN VIVO: telemetría del ESP32 (θ, ω, ω_disco medidos y φ_disco medido).
+      · SIMULACIÓN: reproduce una simulación de la ecuación personalizada.
     """
+    TITULO_VIVO = "Animación en tiempo real del péndulo"
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.paused = False
+        self._peticion_sim = None
+        self.sim = None
+        self._sim_t = 0.0
+        self._sim_clock = 0.0
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        # Fila superior
         top_bar = QtWidgets.QHBoxLayout()
         top_bar.setContentsMargins(4, 2, 4, 2)
-
-        self.lbl_titulo = QtWidgets.QLabel("Animación en tiempo real del péndulo")
+        self.lbl_titulo = QtWidgets.QLabel(self.TITULO_VIVO)
         self.lbl_titulo.setStyleSheet("font-weight: bold; font-size: 11pt;")
         top_bar.addWidget(self.lbl_titulo)
         top_bar.addStretch()
-
+        self.btn_live = QtWidgets.QPushButton("● Volver a en vivo")
+        self.btn_live.clicked.connect(self.salir_simulacion)
+        self.btn_live.setVisible(False)
+        top_bar.addWidget(self.btn_live)
         self.chk_pause = QtWidgets.QCheckBox("Pausar")
         self.chk_pause.setStyleSheet("font-size: 9pt;")
         self.chk_pause.toggled.connect(self._on_pause)
         top_bar.addWidget(self.chk_pause)
         layout.addLayout(top_bar)
 
-        # Canvas de dibujo 2D
         self.canvas = PendulumCanvas(self)
         layout.addWidget(self.canvas, stretch=1)
 
-        # Tarjetas de datos mínimos
+        self._timer = QtCore.QTimer(self)
+        self._timer.setInterval(16)          # ~60 fps
+        self._timer.timeout.connect(self._tick_sim)
+
         info_frame = QtWidgets.QFrame()
         info_frame.setObjectName("infoFrame")
         info_layout = QtWidgets.QHBoxLayout(info_frame)
@@ -1225,18 +1286,12 @@ class SchematicPanel(QtWidgets.QWidget):
 
         self.lbl_deg = QtWidgets.QLabel("θ: 0.0°")
         self.lbl_deg.setStyleSheet("font-family: monospace; font-size: 12pt; font-weight: bold;")
-        self.lbl_deg.setToolTip("Ángulo continuo de la barra en grados.")
-
         self.lbl_rad = QtWidgets.QLabel("θ: 0.000 rad")
-        self.lbl_rad.setStyleSheet("font-family: monospace; font-size: 10pt;")
-
         self.lbl_omega = QtWidgets.QLabel("ω: 0.000 rad/s")
-        self.lbl_omega.setStyleSheet("font-family: monospace; font-size: 10pt;")
-
         self.lbl_vdisco = QtWidgets.QLabel("ω_disco: 0.0 rad/s")
-        self.lbl_vdisco.setStyleSheet("font-family: monospace; font-size: 10pt;")
-
         self.lbl_estado = QtWidgets.QLabel("Estado: Colgando")
+        for lbl in (self.lbl_rad, self.lbl_omega, self.lbl_vdisco):
+            lbl.setStyleSheet("font-family: monospace; font-size: 10pt;")
         self.lbl_estado.setStyleSheet("font-size: 10pt; font-style: italic;")
 
         info_layout.addWidget(self.lbl_deg)
@@ -1245,8 +1300,14 @@ class SchematicPanel(QtWidgets.QWidget):
         info_layout.addWidget(self.lbl_vdisco)
         info_layout.addStretch()
         info_layout.addWidget(self.lbl_estado)
-
         layout.addWidget(info_frame)
+
+    @property
+    def en_simulacion(self):
+        return self.sim is not None
+
+    def set_peticion_simulacion(self, cb):
+        self._peticion_sim = cb
 
     def _on_pause(self, activo):
         self.paused = activo
@@ -1257,49 +1318,98 @@ class SchematicPanel(QtWidgets.QWidget):
         color_sub = "#e0e0e0" if dark else "#333333"
         bg_frame = "#1a1a1a" if dark else "#f0f4f8"
         border_frame = "#2d2d2d" if dark else "#dcdcdc"
-
-        self.lbl_deg.setStyleSheet(f"font-family: monospace; font-size: 12pt; font-weight: bold; color: {color_texto};")
-        for lbl in (self.lbl_rad, self.lbl_omega, self.lbl_vdisco, self.lbl_estado, self.lbl_titulo):
+        self.lbl_deg.setStyleSheet(
+            f"font-family: monospace; font-size: 12pt; font-weight: bold; color: {color_texto};")
+        for lbl in (self.lbl_rad, self.lbl_omega, self.lbl_vdisco, self.lbl_estado):
             lbl.setStyleSheet(f"color: {color_sub}; font-size: 10pt;")
         self.lbl_titulo.setStyleSheet(f"color: {color_sub}; font-weight: bold; font-size: 11pt;")
-
         info_frame = self.findChild(QtWidgets.QFrame, "infoFrame")
         if info_frame:
             info_frame.setStyleSheet(
                 f"#infoFrame {{ background-color: {bg_frame}; border: 1px solid {border_frame}; border-radius: 6px; }}"
             )
 
-    def update_telemetria(self, theta: float, omega: float, v_disco: float, dt: float, modo_sist: str):
-        """Actualiza el esquema con los valores instantáneos más recientes."""
-        if self.paused:
-            return
-
-        self.canvas.phi_disco = (self.canvas.phi_disco + v_disco * dt) % (2.0 * math.pi)
-        self.canvas.set_angles(theta, self.canvas.phi_disco)
-
-        deg = math.degrees(theta)
-        e_deg = math.degrees((theta % (2.0 * math.pi)) - math.pi)
-
-        self.lbl_deg.setText(f"θ: {deg:+7.1f}°")
+    def _mostrar(self, theta, omega, v_disco, phi_disco, texto_estado):
+        self.canvas.set_angles(theta, phi_disco % (2.0 * math.pi))
+        self.lbl_deg.setText(f"θ: {math.degrees(theta):+7.1f}°")
         self.lbl_rad.setText(f"θ: {theta:+7.3f} rad")
         self.lbl_omega.setText(f"ω: {omega:+7.2f} rad/s")
         self.lbl_vdisco.setText(f"ω_d: {v_disco:+7.1f} rad/s")
+        self.lbl_estado.setText(texto_estado)
 
+    # ---- EN VIVO ----
+    def update_telemetria(self, theta, omega, v_disco, phi_disco, modo_sist):
+        if self.paused or self.en_simulacion:
+            return
+        e_deg = math.degrees((theta % (2.0 * math.pi)) - math.pi)
+        deg = math.degrees(theta)
         if abs(e_deg) < 10.0:
-            cabe_zona = "Vertical Invertida"
+            zona = "Vertical invertida"
         elif abs(deg % 360.0) < 15.0:
-            cabe_zona = "Colgan2"
+            zona = "Colgando"
         else:
-            cabe_zona = "En movimiento"
-        self.lbl_estado.setText(f"Modo: {modo_sist} | Zona: {cabe_zona}")
+            zona = "En movimiento"
+        self._mostrar(theta, omega, v_disco, phi_disco, f"Modo: {modo_sist} | Zona: {zona}")
 
     def limpiar(self):
+        if self.en_simulacion:
+            return
         self.canvas.set_angles(0.0, 0.0)
         self.lbl_deg.setText("θ: 0.0°")
         self.lbl_rad.setText("θ: 0.000 rad")
         self.lbl_omega.setText("ω: 0.000 rad/s")
         self.lbl_vdisco.setText("ω_d: 0.0 rad/s")
         self.lbl_estado.setText("Estado: Reposo")
+
+    # ---- SIMULACIÓN ----
+    def cargar_simulacion(self, res):
+        if res["t"].size < 2:
+            return False
+        self.sim = res
+        self._sim_t = 0.0
+        self._sim_clock = time.perf_counter()
+        titulo = "Simulación de la ecuación (modelo, no es el péndulo real)"
+        if res.get("aviso"):
+            titulo += f"  ⚠ {res['aviso']}"
+        self.lbl_titulo.setText(titulo)
+        self.btn_live.setVisible(True)
+        self._timer.start()
+        self._render_sim()
+        return True
+
+    def salir_simulacion(self):
+        self._timer.stop()
+        self.sim = None
+        self.btn_live.setVisible(False)
+        self.lbl_titulo.setText(self.TITULO_VIVO)
+        self.limpiar()
+
+    def _tick_sim(self):
+        now = time.perf_counter()
+        dt, self._sim_clock = now - self._sim_clock, now
+        if self.sim is None or self.paused:
+            return
+        self._sim_t += dt
+        if self._sim_t >= self.sim["T"]:
+            self._sim_t = self.sim["T"]
+            self._timer.stop()
+        self._render_sim()
+
+    def _render_sim(self):
+        s = self.sim
+        if s is None:
+            return
+        ts, t = s["t"], self._sim_t
+        th  = float(np.interp(t, ts, s["th"]))
+        w   = float(np.interp(t, ts, s["w"]))
+        wd  = float(np.interp(t, ts, s["wd"]))
+        phi = float(np.interp(t, ts, s["phi"]))
+        E   = float(np.interp(t, ts, s["E"]))
+        i   = min(int(np.searchsorted(ts, t)), ts.size - 1)
+        fase = "LQR (balanceo)" if s["fase"][i] > 0.5 else "swing-up"
+        self._mostrar(th, w, wd, phi,
+                      f"SIMULACIÓN | {fase} | t = {t:4.1f}/{s['T']:.0f} s | "
+                      f"E/E₀ = {E / s['E0']:.2f} | u = {float(s['u'][i]):+5.1f}")
 
 # =====================================================================
 #  VENTANA PRINCIPAL
@@ -1523,7 +1633,8 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         self.panel_fase = PhasePanel()
         self.tabs_graficas.addTab(self.panel_fase, "Plano de fase")
         self.panel_esquema = SchematicPanel() 
-        self.tabs_graficas.addTab(self.panel_esquema, "Esquema Péndulo")  # ← NUEVO
+        self.tabs_graficas.addTab(self.panel_esquema, "Esquema Péndulo") 
+        self.panel_esquema.set_peticion_simulacion(self._simular_en_esquema)
         splitter.addWidget(self.tabs_graficas)
         splitter.addWidget(panel_derecho)
         splitter.setStretchFactor(0, 3)
@@ -1875,61 +1986,98 @@ class InterfazPendulo(QtWidgets.QMainWindow):
 
         return g
     
-    def _on_preview_expr(self):
-        eq = self.le_expr_custom.text().strip()
+    def _gains_sim(self):
+        """Ganancias LQR para la simulación (de la UI o, si están en 0, las default)."""
+        try:
+            g = self._leer_ganancias_ui()
+            vals = (g["L1"], g["L2"], g["L3"])
+        except ValueError:
+            vals = (0.0, 0.0, 0.0)
+        return vals if any(vals) else GANANCIAS_DEFAULT
+
+    def _simular_en_esquema(self):
+        eq = self.le_expr_custom.toPlainText().strip()
         if not eq:
-            QtWidgets.QMessageBox.information(self, "Vacío", "Escribí primero una ecuación.")
+            QtWidgets.QMessageBox.information(
+                self, "Vacío", "No es el Rollo del Dragón, escribí algo.")
             return
         try:
-            # Validación rápida: compilar una vez en Python para detectar sintaxis
-            compile(eq, "<expr>", "eval")
-        except SyntaxError as e:
-            QtWidgets.QMessageBox.critical(self, "Sintaxis",
-                f"Ecuación inválida:\n{e}")
+            res = _simular_ecuacion(eq, self.sp_wmaxi.value(), self._gains_sim(),
+                                    T_sim=self.sp_duracion.value())
+        except Exception as ex:
+            QtWidgets.QMessageBox.critical(self, "Simulación", f"No se pudo simular:\n{ex}")
             return
-        EquationPreviewDialog(eq, self.sp_wmaxi.value(), self).exec()
+        if res["t"].size < 2:
+            msg = res.get("aviso") or "la simulación no produjo resultados válidos"
+            QtWidgets.QMessageBox.warning(
+                self, "Simulación vacía",
+                f"Pero no ese algo.\nFallo:\n\n{msg}\n\n"
+                "Tony Stark lo pudo construir en una cueva!\n"
+                "Con un poco de metal!!")
+            return
+        self.tabs_graficas.setCurrentWidget(self.panel_esquema)
+        self.panel_esquema.cargar_simulacion(res)
+        self._mostrar_evento("🎬 Reproduciendo simulación en el esquema",
+                            ms=5000, color="#078da7")
     
     def _crear_grupo_control_personal(self):
         g = QtWidgets.QGroupBox("Control Personalizado (Swing-Wp)")
         v = QtWidgets.QVBoxLayout(g)
 
         info = QtWidgets.QLabel(
-            "Control de Swing-Up personalizado.\n"
-            "Variables disponibles:\n"
-            "theta, w_barra, w_disco, u_prev, wmaxi (multiplicador de E),\n"
-            "e, E, E0, q1, q2, q3, rho\n"
+            "Variables: theta, w_barra, w_disco, u_prev, wmaxi,\n"
+            "           e, E, E0, q1, q2, q3, rho\n"
+            "Funciones: sin, cos, tan, asin, acos, atan, atan2,\n"
+            "           sqrt, exp, ln, log (base 10), abs, pi\n"
+            "Operadores: + - * / % y ^ (potencia)\n"
+            "Trampas: -x^2 = (-x)^2 → usá x*x.  No hay sign/max/iff."
         )
         info.setWordWrap(True)
         info.setStyleSheet("font-size: 9pt; color: #555555;")
         v.addWidget(info)
 
-        self.le_expr_custom = QtWidgets.QLineEdit()
+        self.le_expr_custom = EquationEditor(min_lines=1, max_lines=4)
         self.le_expr_custom.setPlaceholderText("Ej: 10*sin(theta) - 2*w_barra")
-        self.le_expr_custom.returnPressed.connect(self._on_send_expr)
         self.le_expr_custom.textChanged.connect(self._actualizar_indicador_expr)
         v.addWidget(self.le_expr_custom)
+
+        fila_dur = QtWidgets.QHBoxLayout()
+        fila_dur.addWidget(QtWidgets.QLabel("Duración de la simulación:"))
+        self.sp_duracion = FlexibleDoubleSpinBox()
+        self.sp_duracion.setRange(2.0, 120.0)
+        self.sp_duracion.setValue(40.0)
+        self.sp_duracion.setSingleStep(5.0)
+        self.sp_duracion.setDecimals(1)
+        self.sp_duracion.setSuffix(" s")
+        fila_dur.addWidget(self.sp_duracion)
+        fila_dur.addStretch()
+        v.addLayout(fila_dur)
 
         h = QtWidgets.QHBoxLayout()
         self.btn_send_expr = QtWidgets.QPushButton("▶ Aplicar Ecuación")
         self.btn_send_expr.setStyleSheet(ESTILO_ENVIAR)
         self.btn_send_expr.clicked.connect(self._on_send_expr)
-        
         self.btn_reset_expr = QtWidgets.QPushButton("↺ Volver al Default")
         self.btn_reset_expr.setStyleSheet(ESTILO_GRABAR)
         self.btn_reset_expr.clicked.connect(self._on_reset_expr)
+        h.addWidget(self.btn_send_expr)
+        h.addWidget(self.btn_reset_expr)
+        v.addLayout(h)
 
-        self.btn_preview = QtWidgets.QPushButton("👁 Previsualizar")
-        self.btn_preview.clicked.connect(self._on_preview_expr)
-        v.addWidget(self.btn_preview)
+        h2 = QtWidgets.QHBoxLayout()
+        self.btn_sim_esquema = QtWidgets.QPushButton("🎬 Simular en el esquema")
+        self.btn_sim_esquema.setStyleSheet(ESTILO_ENVIAR)
+        self.btn_sim_esquema.setToolTip(
+            "Anima la simulación en la pestaña «Esquema Péndulo».\n"
+            "Funciona sin conexión al ESP32."
+        )
+        self.btn_sim_esquema.clicked.connect(self._simular_en_esquema)
+        h2.addWidget(self.btn_sim_esquema)
+        v.addLayout(h2)
 
         self.lbl_expr_estado = QtWidgets.QLabel("")
         self.lbl_expr_estado.setStyleSheet("font-style: italic; font-size: 9pt;")
         v.addWidget(self.lbl_expr_estado)
-        
-        h.addWidget(self.btn_send_expr)
-        h.addWidget(self.btn_reset_expr)
-        v.addLayout(h)
-        
         return g
 
     
@@ -2071,14 +2219,18 @@ class InterfazPendulo(QtWidgets.QMainWindow):
     def _update_gain_button_state(self):
         puede = (not self.motor_moving) and self.serial.handshake_completo
         self.btn_send_gains.setEnabled(puede)
-        self.btn_zero.setEnabled(puede)       
-        self.btn_preview.setEnabled(puede)       
+        self.btn_zero.setEnabled(puede)        
         for le in self.inputs_L.values():
             le.setEnabled(puede)
         #control custom para alumnos
         self.btn_send_expr.setEnabled(puede)
         self.btn_reset_expr.setEnabled(puede)
-        self.le_expr_custom.setEnabled(puede)
+
+        #Siempre se puede simular
+        self.le_expr_custom.setEnabled(True)
+        self.sp_duracion.setEnabled(True)
+        self.btn_sim_esquema.setEnabled(True)
+
 
         # WMAXI: se puede ajustar con el motor en marcha si hay handshake
         puede_wmaxi = self.serial.handshake_completo
@@ -2505,7 +2657,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         if not self.serial.handshake_completo:
             self.lbl_expr_estado.setText("")
             return
-        campo_vacio = not self.le_expr_custom.text().strip()
+        campo_vacio = not self.le_expr_custom.toPlainText().strip()
         if self._expr_fw_on and campo_vacio:
             self.lbl_expr_estado.setText(
                 "⚠ Hay una ecuación activa en el firmware, pero el campo está vacío."
@@ -2705,7 +2857,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Sin conexión", "No hay handshake")
             return
 
-        eq = self.le_expr_custom.text().strip()
+        eq = self.le_expr_custom.toPlainText().strip()
         if not eq:
             return
 
@@ -2863,7 +3015,7 @@ class InterfazPendulo(QtWidgets.QMainWindow):
         estilo_enviar = ESTILO_ENVIAR_BATMAN if activo else ESTILO_ENVIAR_CLARO
         for btn in (self.btn_exc_start, self.btn_send_gains, self.btn_send_wmaxi,
                     self.btn_send_obs, self.btn_send_kal, self.btn_apply_est,
-                    self.btn_send_expr, self.btn_preview):
+                    self.btn_send_expr, self.btn_sim_esquema):
             btn.setStyleSheet(estilo_enviar)
 
         # 4) Avisos rojo-oscuro: sobre fondo negro casi no se leen
@@ -2976,18 +3128,12 @@ class InterfazPendulo(QtWidgets.QMainWindow):
                 np.fromiter(self.vel_buf, dtype=np.float64, count=n),
             )
 
-        #Esquema de la barra en tiempo real
-        if self.panel_esquema.isVisible() and len(self.t_buf) > 0:
-            theta_act = float(self.pos_buf[-1])
-            omega_act = float(self.vel_buf[-1])
-            disco_act = float(self.disco_buf[-1])
-            if len(self.t_buf) >= 2:
-                dt = float(self.t_buf[-1] - self.t_buf[-2])
-                if dt <= 0 or dt > 0.5:
-                    dt = 1.0 / FS_HZ
-            else:
-                dt = 1.0 / FS_HZ
-            self.panel_esquema.update_telemetria(theta_act, omega_act, disco_act, dt, self.mode)
+        # Esquema en tiempo real (si hay simulación cargada, manda la simulación)
+        if (self.panel_esquema.isVisible() and not self.panel_esquema.en_simulacion
+                and len(self.t_buf) > 0):
+            self.panel_esquema.update_telemetria(
+                float(self.pos_buf[-1]), float(self.vel_buf[-1]),
+                float(self.disco_buf[-1]), float(self.phi_disco_buf[-1]), self.mode)
 
         # Textos de UI a baja frecuencia
         self._status_div += 1
@@ -2998,115 +3144,184 @@ class InterfazPendulo(QtWidgets.QMainWindow):
                 self.lbl_record.setText(f"Muestras grabadas: {len(self.recorded_data)}")
             self._update_status_bar()
 
-def _simular_ecuacion(expr_str, wmaxi_mult, T_sim=10.0, dt=1.0/500.0,
-                      theta0=0.1, omega0=0.0):
-    """Integra θ̈ = -q1·sinθ - q3·u + q2·ωd,  ω̇d = rho·(q3·u - q2·ωd) - θ̈.
-    Devuelve (t, θ, ωbarra, ωdisco, u, E, E0)."""
-    code = compile(expr_str, "<expr>", "eval")
+def _error_vertical(ang):
+    k = round((ang - math.pi) / (2.0 * math.pi))
+    return ang - (math.pi + 2.0 * math.pi * k)
+
+
+def _motor_set_sim(u):
+    """Réplica de motor_set(): saturación, duty, zona muerta y u efectiva."""
+    if not math.isfinite(u):
+        u = 0.0
+    u = max(-PEND_UMAX, min(PEND_UMAX, u))
+    duty = min(int(abs(u) / PEND_UMAX * PWM_MAX), PWM_MAX)
+    if 0 < duty < PWM_MIN:
+        duty = PWM_MIN
+    d0 = duty if u > 0.2 else 0
+    d1 = duty if u < -0.2 else 0
+    u_ef = duty / PWM_MAX * PEND_UMAX
+    return -u_ef if d1 > 0 else (u_ef if d0 > 0 else 0.0)
+
+
+def _swingup_default(th, w, wd, wmaxi_mult):
+    """control_energia() del firmware sin ecuación personalizada."""
     q1, q2, q3, rho = PEND_Q1, PEND_Q2, PEND_Q3, PEND_RHO
-    E0 = 2.0 * q1 * rho
+    kmot = 1.0 / (rho * q3 * 0.08)
+    cero = 0.2 * math.sqrt(q1)
+    discri = (2.0 * wmaxi_mult * q1 * rho
+              - w * w * rho
+              - 2.0 * q1 * rho * (1.0 - math.cos(th)))
+    if discri < 0.0:
+        return -w
+    raiz = math.sqrt(discri)
+    vel = 0.0
+    if w > cero:
+        vel = -w - raiz
+    if w < -cero:
+        vel = -w + raiz
+    return kmot * (vel - wd) + (q2 / q3) * wd
 
-    n = int(T_sim / dt)
-    t_a   = np.zeros(n)
-    th_a  = np.zeros(n)
-    w_a   = np.zeros(n)
-    wd_a  = np.zeros(n)
-    u_a   = np.zeros(n)
-    E_a   = np.zeros(n)
-    th, w, wd, u_prev = theta0, omega0, 0.0, 0.0
 
-    # Namespace restringido (sin builtins, sin math.e para no pisar 'e')
-    base = {
+def _compilar_expr(expr_str):
+    """Compila la ecuación con un namespace restringido compatible con tinyexpr."""
+    # Traducción mínima: ^ -> ** (potencia). Ojo: asocia distinto que tinyexpr,
+    # pero para uso docente alcanza. Se documenta en el tooltip.
+    src = re.sub(r"\^", "**", expr_str)
+    namespace = {
         "sin": math.sin, "cos": math.cos, "tan": math.tan,
         "asin": math.asin, "acos": math.acos, "atan": math.atan,
         "atan2": math.atan2, "sqrt": math.sqrt, "exp": math.exp,
-        "log": math.log10, "ln": math.log, "abs": abs,
-        "pi": math.pi,
-        "q1": q1, "q2": q2, "q3": q3, "rho": rho,
+        "log": math.log10, "ln": math.log, "abs": abs, "pi": math.pi,
+        "q1": PEND_Q1, "q2": PEND_Q2, "q3": PEND_Q3, "rho": PEND_RHO,
     }
+    code = compile(src, "<expr>", "eval")
+    return code, namespace
 
-    for i in range(n):
-        t_now = i * dt
+
+def _simular_ecuacion(expr_str, wmaxi_mult, gains=GANANCIAS_DEFAULT,
+                      T_sim=40.0, theta0=0.1, omega0=0.0, n_sub=5):
+    """Simula el modo AUTO completo: swing-up -> captura LQR -> recaída.
+    Control a 200 Hz con ZOH, planta integrada en n_sub sub-pasos.
+    Sin ruido y sin protección por RPM (no está en el firmware).
+    Devuelve dict con t, th, w, wd, phi, u, E, fase, E0, T, aviso."""
+    f_expr = _compilar_expr(expr_str) if expr_str and expr_str.strip() else None
+    q1, q2, q3, rho = PEND_Q1, PEND_Q2, PEND_Q3, PEND_RHO
+    E0 = 2.0 * q1 * rho
+    L1, L2, L3 = gains
+    dt = TS_CTRL / n_sub
+    n = int(round(T_sim / TS_CTRL))
+
+    t_a = np.arange(n) * TS_CTRL
+    cols = {k: np.zeros(n) for k in ("th", "w", "wd", "phi", "u", "E", "fase")}
+    th, w, wd, phi = theta0, omega0, 0.0, 0.0
+    u_ap, fase = 0.0, 0
+    aviso, n_ok = "", n
+
+    for k in range(n):
+        if not all(math.isfinite(v) for v in (th, w, wd)) or abs(wd) > 1e7:
+            aviso = f"la simulación divergió en t = {t_a[k-1] if k else 0:.2f} s"
+            n_ok = k
+            break
+
+        e_signed = _error_vertical(th)
+        e_abs = abs(e_signed)
+        if fase == 0 and e_abs < PEND_CAPT_RAD:
+            fase = 1
+        elif fase == 1 and e_abs > PEND_SALIDA_RAD:
+            fase = 0
+
         E = 0.5 * rho * w * w + q1 * rho * (1.0 - math.cos(th))
-        e_err = (th - math.pi) - 2*math.pi*round((th - math.pi)/(2*math.pi))
+        if fase == 1:
+            u = -(L1 * e_signed + L2 * w + L3 * wd)
+        elif f_expr is not None:
+            code, ns = f_expr
+            ns.update(theta=th, w_barra=w, w_disco=wd, u_prev=u_ap,
+                      e=e_signed, E=E, wmaxi=wmaxi_mult, E0=E0)
+            try:
+                u = float(eval(code, {"__builtins__": {}}, ns))
+            except Exception as ex:
+                aviso = f"error evaluando la ecuación en t = {t_a[k]:.2f} s: {ex}"
+                n_ok = k
+                break
+        else:
+            u = _swingup_default(th, w, wd, wmaxi_mult)
 
-        env = dict(base)
-        env.update(theta=th, w_barra=w, w_disco=wd, u_prev=u_prev,
-                   wmaxi=wmaxi_mult, e=e_err, E=E, E0=E0)
-        try:
-            u = float(eval(code, {"__builtins__": {}}, env))
-        except Exception as ex:
-            raise RuntimeError(f"Evaluación falló en t={t_now:.3f} s: {ex}")
         if not math.isfinite(u):
             u = 0.0
         u = max(-PEND_UMAX, min(PEND_UMAX, u))
 
-        th_ddot = -q1 * math.sin(th) - q3 * u + q2 * wd
-        wd_ddot = rho * (q3 * u - q2 * wd) - th_ddot
+        cols["th"][k], cols["w"][k], cols["wd"][k], cols["phi"][k] = th, w, wd, phi
+        cols["u"][k], cols["E"][k], cols["fase"][k] = u, E, fase
 
-        w  += th_ddot * dt
-        th += w * dt
-        wd += wd_ddot * dt
-        u_prev = u
+        u_ap = _motor_set_sim(u)
+        for _ in range(n_sub):
+            th_dd = -q1 * math.sin(th) - q3 * u_ap + q2 * wd
+            wd_dd = rho * (q3 * u_ap - q2 * wd) - th_dd
+            w  += th_dd * dt
+            th += w * dt
+            wd += wd_dd * dt
+            phi += wd * dt
 
-        t_a[i], th_a[i], w_a[i], wd_a[i], u_a[i] = t_now, th, w, wd, u
-        E_a[i] = 0.5 * rho * w * w + q1 * rho * (1.0 - math.cos(th))
+    res = {k: v[:n_ok] for k, v in cols.items()}
+    res["t"] = t_a[:n_ok]
+    res["E0"] = E0
+    res["T"] = float(t_a[n_ok - 1]) if n_ok > 1 else 0.0
+    res["aviso"] = aviso
+    return res
 
-    return t_a, th_a, w_a, wd_a, u_a, E_a, np.full_like(E_a, E0)
+# class EquationPreviewDialog(QtWidgets.QDialog):
+#     def __init__(self, expr_str, wmaxi_mult, parent=None):
+#         super().__init__(parent)
+#         self.setWindowTitle("Vista previa — simulación 10 s")
+#         self.resize(860, 720)
+#         self._expr = expr_str
+#         self._wmaxi = wmaxi_mult
 
-class EquationPreviewDialog(QtWidgets.QDialog):
-    def __init__(self, expr_str, wmaxi_mult, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Vista previa — simulación 10 s")
-        self.resize(860, 720)
-        self._expr = expr_str
-        self._wmaxi = wmaxi_mult
+#         v = QtWidgets.QVBoxLayout(self)
+#         self.glw = pg.GraphicsLayoutWidget()
+#         self.p_th  = self.glw.addPlot(row=0, col=0, title="θ (rad)")
+#         self.p_w   = self.glw.addPlot(row=1, col=0, title="ω_barra (rad/s)")
+#         self.p_E   = self.glw.addPlot(row=2, col=0, title="E vs E₀ (J)")
+#         for p in (self.p_th, self.p_w, self.p_E):
+#             p.showGrid(x=True, y=True, alpha=0.25)
+#         self.c_th  = self.p_th.plot(pen=pg.mkPen('#1976D2', width=2))
+#         self.c_w   = self.p_w.plot(pen=pg.mkPen('#E53935', width=2))
+#         self.c_E   = self.p_E.plot(pen=pg.mkPen('#43A047', width=2), name="E")
+#         self.c_E0  = self.p_E.plot(pen=pg.mkPen('#424242', width=1,
+#                                                 style=QtCore.Qt.PenStyle.DashLine), name="E₀")
+#         v.addWidget(self.glw, stretch=1)
 
-        v = QtWidgets.QVBoxLayout(self)
-        self.glw = pg.GraphicsLayoutWidget()
-        self.p_th  = self.glw.addPlot(row=0, col=0, title="θ (rad)")
-        self.p_w   = self.glw.addPlot(row=1, col=0, title="ω_barra (rad/s)")
-        self.p_E   = self.glw.addPlot(row=2, col=0, title="E vs E₀ (J)")
-        for p in (self.p_th, self.p_w, self.p_E):
-            p.showGrid(x=True, y=True, alpha=0.25)
-        self.c_th  = self.p_th.plot(pen=pg.mkPen('#1976D2', width=2))
-        self.c_w   = self.p_w.plot(pen=pg.mkPen('#E53935', width=2))
-        self.c_E   = self.p_E.plot(pen=pg.mkPen('#43A047', width=2), name="E")
-        self.c_E0  = self.p_E.plot(pen=pg.mkPen('#424242', width=1,
-                                                style=QtCore.Qt.PenStyle.DashLine), name="E₀")
-        v.addWidget(self.glw, stretch=1)
+#         self.lbl = QtWidgets.QLabel("—")
+#         self.lbl.setStyleSheet("font-family: monospace; font-size: 10pt;")
+#         v.addWidget(self.lbl)
 
-        self.lbl = QtWidgets.QLabel("—")
-        self.lbl.setStyleSheet("font-family: monospace; font-size: 10pt;")
-        v.addWidget(self.lbl)
+#         h = QtWidgets.QHBoxLayout()
+#         btn_re  = QtWidgets.QPushButton("Re-simular")
+#         btn_re.clicked.connect(self._run)
+#         btn_ok  = QtWidgets.QPushButton("Cerrar")
+#         btn_ok.clicked.connect(self.accept)
+#         h.addWidget(btn_re); h.addStretch(); h.addWidget(btn_ok)
+#         v.addLayout(h)
 
-        h = QtWidgets.QHBoxLayout()
-        btn_re  = QtWidgets.QPushButton("Re-simular")
-        btn_re.clicked.connect(self._run)
-        btn_ok  = QtWidgets.QPushButton("Cerrar")
-        btn_ok.clicked.connect(self.accept)
-        h.addWidget(btn_re); h.addStretch(); h.addWidget(btn_ok)
-        v.addLayout(h)
+#         self._run()
 
-        self._run()
-
-    def _run(self):
-        try:
-            t, th, w, wd, u, E, E0 = _simular_ecuacion(self._expr, self._wmaxi)
-        except Exception as ex:
-            self.lbl.setText(f"⚠ {ex}")
-            self.c_th.setData([], []); self.c_w.setData([], [])
-            self.c_E.setData([], []);  self.c_E0.setData([], [])
-            return
-        self.c_th.setData(t, th)
-        self.c_w.setData(t, w)
-        self.c_E.setData(t, E)
-        self.c_E0.setData(t, E0)
-        e_final = (th[-1] - math.pi) - 2*math.pi*round((th[-1] - math.pi)/(2*math.pi))
-        self.lbl.setText(
-            f"t_fin = {t[-1]:.1f} s   |   e_final = {math.degrees(e_final):+6.2f}°"
-            f"   |   E_final / E₀ = {E[-1]/E0[-1]:.3f}   |   |u|_max = {np.abs(u).max():.2f}"
-        )
+#     def _run(self):
+#         try:
+#             t, th, w, wd, u, E, E0 = _simular_ecuacion(self._expr, self._wmaxi)
+#         except Exception as ex:
+#             self.lbl.setText(f"⚠ {ex}")
+#             self.c_th.setData([], []); self.c_w.setData([], [])
+#             self.c_E.setData([], []);  self.c_E0.setData([], [])
+#             return
+#         self.c_th.setData(t, th)
+#         self.c_w.setData(t, w)
+#         self.c_E.setData(t, E)
+#         self.c_E0.setData(t, E0)
+#         e_final = (th[-1] - math.pi) - 2*math.pi*round((th[-1] - math.pi)/(2*math.pi))
+#         self.lbl.setText(
+#             f"t_fin = {t[-1]:.1f} s   |   e_final = {math.degrees(e_final):+6.2f}°"
+#             f"   |   E_final / E₀ = {E[-1]/E0[-1]:.3f}   |   |u|_max = {np.abs(u).max():.2f}"
+#         )
 
 # =====================================================================
 #  Entry point
